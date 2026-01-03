@@ -1,0 +1,54 @@
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+temp/
+logs/
+
+# Build outputs and dependencies
+node_modules/
+dist/
+build/
+target/
+out/
+bin/
+obj/
+
+# Environment and configuration files
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+config.local.json
+secrets.json
+
+# Package manager files
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# PowerShell specific
+*.ps1xml
+*.psd1
+*.psm1
+
+# Azure DevOps specific
+.azure/
+azure-pipelines-*.yml
