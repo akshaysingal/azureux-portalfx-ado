@@ -49,6 +49,12 @@ function New-AdoWorkItem {
         [string] $Iteration = 'One\Krypton',
 
         [Parameter()]
+        [string] $AssignedTo = 'aksingal@microsoft.com',
+
+        [Parameter()]
+        [string] $Tags = 'autogen',
+
+        [Parameter()]
         [string] $ApiVersion = '7.1',
 
         [Parameter()]
@@ -59,9 +65,9 @@ function New-AdoWorkItem {
         @{ op = 'add'; path = '/fields/System.Title';         value = $Title }
         @{ op = 'add'; path = '/fields/System.AreaPath';      value = $Area }
         @{ op = 'add'; path = '/fields/System.IterationPath'; value = $Iteration }
-        @{ op = 'add'; path = '/fields/System.AssignedTo';    value = 'aksingal@microsoft.com' }
+        @{ op = 'add'; path = '/fields/System.AssignedTo';    value = $AssignedTo }
         @{ op = 'add'; path = '/fields/System.State';         value = $State }
-        @{ op = 'add'; path = '/fields/System.Tags'; value = 'autogen' }
+        @{ op = 'add'; path = '/fields/System.Tags';          value = $Tags }
     ) | ConvertTo-Json -Depth 10
 
     $tempFile = [System.IO.Path]::GetTempFileName()
@@ -174,6 +180,129 @@ function New-WorkItemInternal {
 #------------------------------------------------------------------------------
 # PUBLIC WRAPPER FUNCTIONS (User-facing commands)
 #------------------------------------------------------------------------------
+
+function CreateWorkItem {
+    <#
+    .SYNOPSIS
+        Interactive work item creation with user prompts.
+    .DESCRIPTION
+        Prompts the user for all work item details and creates a new work item in Azure DevOps.
+        Uses default values when user provides empty input (except for Title which is mandatory).
+    .EXAMPLE
+        CreateWorkItem
+    #>
+    [CmdletBinding()]
+    param()
+
+    Write-Host "`n=== Azure DevOps Work Item Creation ===" -ForegroundColor Cyan
+    Write-Host "Press Enter to use default values (shown in brackets)" -ForegroundColor Gray
+    Write-Host ""
+
+    # Prompt for Kind with validation
+    do {
+        $kind = Read-Host "Work Item Type [Bug]: (Bug/PBI/Task)"
+        if ([string]::IsNullOrWhiteSpace($kind)) {
+            $kind = "Bug"
+        }
+        $kind = $kind.Trim()
+        
+        if ($kind -notin @('Bug', 'PBI', 'Product Backlog Item', 'Task')) {
+            Write-Host "Invalid work item type. Please enter 'Bug', 'PBI', or 'Task'." -ForegroundColor Red
+            $kind = $null
+        }
+        elseif ($kind -eq 'PBI') {
+            $kind = 'Product Backlog Item'
+        }
+    } while ([string]::IsNullOrWhiteSpace($kind))
+
+    # Prompt for Title - mandatory field
+    do {
+        $title = Read-Host "Title (required)"
+        if ([string]::IsNullOrWhiteSpace($title)) {
+            Write-Host "Title cannot be empty. Please provide a title." -ForegroundColor Red
+        }
+    } while ([string]::IsNullOrWhiteSpace($title))
+
+    # Prompt for Area Path
+    $areaPath = Read-Host "Area Path [One\Azure Portal\Hubs]"
+    if ([string]::IsNullOrWhiteSpace($areaPath)) {
+        $areaPath = "One\Azure Portal\Hubs"
+    }
+
+    # Prompt for Iteration Path
+    $iterationPath = Read-Host "Iteration Path [One\Krypton]"
+    if ([string]::IsNullOrWhiteSpace($iterationPath)) {
+        $iterationPath = "One\Krypton"
+    }
+
+    # Prompt for Assigned To
+    $assignedTo = Read-Host "Assigned To [aksingal]"
+    if ([string]::IsNullOrWhiteSpace($assignedTo)) {
+        $assignedTo = "aksingal"
+    }
+    # Add @microsoft.com suffix
+    $assignedTo = "$assignedTo@microsoft.com"
+
+    # Prompt for State with validation
+    do {
+        $state = Read-Host "State [Active]: (New/Active/Committed/Approved/In Review)"
+        if ([string]::IsNullOrWhiteSpace($state)) {
+            $state = "Active"
+        }
+        $state = $state.Trim()
+        
+        # Convert to proper case for validation and storage
+        $validStates = @{
+            'new' = 'New'
+            'active' = 'Active'
+            'committed' = 'Committed'
+            'approved' = 'Approved'
+            'in review' = 'In Review'
+        }
+        
+        $stateLower = $state.ToLower()
+        if ($validStates.ContainsKey($stateLower)) {
+            $state = $validStates[$stateLower]
+        } else {
+            Write-Host "Invalid state. Please enter: New, Active, Committed, Approved, or 'In Review'." -ForegroundColor Red
+            $state = $null
+        }
+    } while ([string]::IsNullOrWhiteSpace($state))
+
+    # Prompt for Tags
+    $additionalTags = Read-Host "Additional Tags (will be appended to 'autogen')"
+    if ([string]::IsNullOrWhiteSpace($additionalTags)) {
+        $tags = "autogen"
+    } else {
+        $tags = "autogen; $($additionalTags.Trim())"
+    }
+
+    # Display summary and confirm
+    Write-Host "`n=== Work Item Summary ===" -ForegroundColor Yellow
+    Write-Host "Type: $kind"
+    Write-Host "Title: $title"
+    Write-Host "Area Path: $areaPath"
+    Write-Host "Iteration Path: $iterationPath"
+    Write-Host "Assigned To: $assignedTo"
+    Write-Host "State: $state"
+    Write-Host "Tags: $tags"
+    Write-Host ""
+
+    $confirm = Read-Host "Create this work item? (y/N)"
+    if ($confirm -match '^[Yy]') {
+        try {
+            # Create the work item
+            $result = New-AdoWorkItem -Type $kind -Title $title.Trim() -Area $areaPath -Iteration $iterationPath -AssignedTo $assignedTo -State $state -Tags $tags -QuietlyReturn:$false
+            Write-Host "`nWork item created successfully!" -ForegroundColor Green
+        }
+        catch {
+            Write-Host "`nFailed to create work item: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+    else {
+        Write-Host "Work item creation cancelled." -ForegroundColor Yellow
+    }
+}
 
 function bug {
     <#
