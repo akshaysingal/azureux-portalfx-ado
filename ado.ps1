@@ -1,13 +1,25 @@
-###
-# Azure DevOps Work Item Helper Functions
-###
+#==============================================================================
+# AZURE DEVOPS WORK ITEM MANAGEMENT SCRIPT
+#==============================================================================
+
+#------------------------------------------------------------------------------
+# HELPER FUNCTIONS (Internal use only)
+#------------------------------------------------------------------------------
 
 function Get-AdoAuthHeader {
+    <#
+    .SYNOPSIS
+        Creates authentication header for Azure DevOps REST API calls.
+    .DESCRIPTION
+        Helper function to generate the authentication header using PAT token.
+    #>
     [CmdletBinding()]
     param(
         [Parameter()]
         [string] $Pat = $env:AZDO_PAT
     )
+
+    $Pat = ""
 
     if ([string]::IsNullOrWhiteSpace($Pat)) {
         throw "AZDO_PAT env var is empty. Set it first: `$env:AZDO_PAT = '<PAT>'"
@@ -18,6 +30,12 @@ function Get-AdoAuthHeader {
 }
 
 function New-AdoWorkItem {
+    <#
+    .SYNOPSIS
+        Creates a new work item in Azure DevOps.
+    .DESCRIPTION
+        Core helper function that handles the REST API call to create work items.
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -92,11 +110,13 @@ function New-AdoWorkItem {
     }
 }
 
-###
-# Convenience Wrappers - to create common work item types
-###
-
-function wi {
+function New-WorkItemInternal {
+    <#
+    .SYNOPSIS
+        Generic work item creation helper.
+    .DESCRIPTION
+        Internal helper function that maps work item types and states for the public wrapper functions.
+    #>
     [CmdletBinding(DefaultParameterSetName = 'Active')]
     param(
         [Parameter(Mandatory, Position = 0)]
@@ -146,7 +166,22 @@ function wi {
     New-AdoWorkItem -Type $typeMap[$Kind] -Title $Title.Trim() -State $stateMap[$stateKey] -QuietlyReturn:$false
 }
 
+#------------------------------------------------------------------------------
+# PUBLIC WRAPPER FUNCTIONS (User-facing commands)
+#------------------------------------------------------------------------------
+
 function bug {
+    <#
+    .SYNOPSIS
+        Creates a bug work item.
+    .DESCRIPTION
+        Shorthand command to create bug work items with various states.
+    .PARAMETER Title
+        Title of the bug
+    .EXAMPLE
+        bug "Login fails on IE" -Active
+        bug "Memory leak in service" -New
+    #>
     [CmdletBinding(DefaultParameterSetName = 'Active')]
     param(
         [Parameter(Mandatory, Position = 0)]
@@ -169,10 +204,21 @@ function bug {
         [switch] $Approved
     )
 
-    wi -Kind bug -Title $Title @PSBoundParameters
+    New-WorkItemInternal -Kind bug -Title $Title @PSBoundParameters
 }
 
 function pbi {
+    <#
+    .SYNOPSIS
+        Creates a Product Backlog Item (PBI) work item.
+    .DESCRIPTION
+        Shorthand command to create PBI work items with various states.
+    .PARAMETER Title
+        Title of the PBI
+    .EXAMPLE
+        pbi "Add user management feature" -New
+        pbi "Implement search functionality" -Active
+    #>
     [CmdletBinding(DefaultParameterSetName = 'Active')]
     param(
         [Parameter(Mandatory, Position = 0)]
@@ -195,5 +241,5 @@ function pbi {
         [switch] $Approved
     )
 
-    wi -Kind pbi -Title $Title @PSBoundParameters
+    New-WorkItemInternal -Kind pbi -Title $Title @PSBoundParameters
 }
