@@ -6,108 +6,113 @@
 # HELPER FUNCTIONS (Internal use only)
 #------------------------------------------------------------------------------
 
-function Get-AdoAuthHeader {
-    <#
-    .SYNOPSIS
-        Creates authentication header for Azure DevOps REST API calls.
-    .DESCRIPTION
-        Helper function to generate the authentication header using PAT token.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter()]
-        [string] $Pat = $env:AZDO_PAT
-    )
-
-    $Pat = ""
-
-    if ([string]::IsNullOrWhiteSpace($Pat)) {
-        throw "AZDO_PAT env var is empty. Set it first: `$env:AZDO_PAT = '<PAT>'"
+function Ensure-AzDevOpsLogin {
+    try {
+        az account show --only-show-errors | Out-Null
+    }
+    catch {
+        Write-Host "Azure login required. Launching az login..." -ForegroundColor Yellow
+        az login | Out-Null
     }
 
-    $base64 = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes(":$Pat"))
-    return @{ Authorization = "Basic $base64" }
+    try {
+        az devops project list --only-show-errors | Out-Null
+    }
+    catch {
+        Write-Host "Azure DevOps login required. Launching az devops login..." -ForegroundColor Yellow
+        az devops login | Out-Null
+    }
 }
 
 function New-AdoWorkItem {
-    <#
-    .SYNOPSIS
-        Creates a new work item in Azure DevOps.
-    .DESCRIPTION
-        Core helper function that handles the REST API call to create work items.
-    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
-        [ValidateNotNullOrEmpty()]
         [string] $Title,
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $Type = 'Bug',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $State = 'Active',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
-        [string] $Organization = 'msazure',
+        [string] $Organization = 'https://dev.azure.com/msazure',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $Project = 'One',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $Area = 'One\Azure Portal\Hubs',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $Iteration = 'One\Krypton',
 
         [Parameter()]
-        [ValidateNotNullOrEmpty()]
         [string] $ApiVersion = '7.1',
 
         [Parameter()]
         [switch] $QuietlyReturn
     )
 
-    $uri = 'https://dev.azure.com/{0}/{1}/_apis/wit/workitems/${2}?api-version={3}' -f `
-            $Organization, $Project, $Type, $ApiVersion
-
-    $AssignedTo = "aksingal@microsoft.com"
-
-    $bodyObj = @(
+    $patch = @(
         @{ op = 'add'; path = '/fields/System.Title';         value = $Title }
         @{ op = 'add'; path = '/fields/System.AreaPath';      value = $Area }
         @{ op = 'add'; path = '/fields/System.IterationPath'; value = $Iteration }
-        @{ op = 'add'; path = '/fields/System.AssignedTo';    value = $AssignedTo }
+        @{ op = 'add'; path = '/fields/System.AssignedTo';    value = 'aksingal@microsoft.com' }
         @{ op = 'add'; path = '/fields/System.State';         value = $State }
-    )
+        @{ op = 'add'; path = '/fields/System.Tags'; value = 'autogen' }
+    ) | ConvertTo-Json -Depth 10
 
-    $headers = Get-AdoAuthHeader
-    $json    = $bodyObj | ConvertTo-Json -Depth 10
-
+    $tempFile = [System.IO.Path]::GetTempFileName()
     try {
-        $response = Invoke-RestMethod -Method Post -Uri $uri -Headers $headers `
-            -ContentType 'application/json-patch+json' -Body $json
+        $patch | Out-File -FilePath $tempFile -Encoding utf8
 
-        $retVal = "#$($response.id): $($response.fields.'System.Title')"
+        $attempt = 0
+        $maxAttempts = 2
 
-        if ($QuietlyReturn) {
-            return $retVal
-        } else {
-            Write-Host "$($Type) $($retVal) ($($State))" -ForegroundColor Green
-            Write-Host "https://msazure.visualstudio.com/One/_workitems/edit/$($response.id)" -ForegroundColor Green
+        do {
+            try {
+                $response = az devops invoke `
+                    --organization $Organization `
+                    --area wit `
+                    --resource workitems `
+                    --route-parameters "project=$Project" "type=$Type" `
+                    --http-method POST `
+                    --api-version $ApiVersion `
+                    --media-type "application/json-patch+json" `
+                    --in-file $tempFile `
+                    --only-show-errors |
+                    ConvertFrom-Json
+
+                break
+            }
+            catch {
+                if ($attempt -eq 0) {
+                    Write-Host "Auth may be expired. Attempting login..." -ForegroundColor Yellow
+                    Ensure-AzDevOpsLogin
+                }
+                else {
+                    throw
+                }
+            }
+
+            $attempt++
         }
+        while ($attempt -lt $maxAttempts)
     }
-    catch {
-        # Make REST failures easier to debug
-        $msg = $_.Exception.Message
-        throw "Failed to create work item. URI=$uri. Error=$msg"
+    finally {
+        Remove-Item $tempFile -ErrorAction SilentlyContinue
     }
+
+    $retVal = "#$($response.id): $($response.fields.'System.Title')"
+
+    if ($QuietlyReturn) {
+        return $retVal
+    }
+
+    Write-Host "$Type $retVal ($State)" -ForegroundColor Green
+    Write-Host "https://msazure.visualstudio.com/One/_workitems/edit/$($response.id)" -ForegroundColor Green
 }
 
 function New-WorkItemInternal {
