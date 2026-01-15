@@ -605,6 +605,83 @@ function pr {
     }
 }
 
+# Push staged updates to remote branch (amend last commit)
+function push {
+    <#
+    .SYNOPSIS
+        Amends the last commit with staged changes and force pushes to the remote branch.
+    .DESCRIPTION
+        This function provides a streamlined workflow for updating the most recent commit with new changes.
+        It performs the following operations:
+        1. Checks for staged files in the git index
+        2. Amends the last commit with staged changes without editing the commit message
+        3. Force pushes the amended commit to the remote branch
+        
+        This is particularly useful during iterative development where you want to refine the same
+        logical change without creating multiple commits. The function automatically detects the
+        current branch and pushes to the corresponding remote branch.
+        
+        WARNING: This function uses force push (-f) which rewrites git history. Use with caution
+        on shared branches as it may cause issues for other developers who have already pulled
+        the original commit.
+    .EXAMPLE
+        push
+        
+        Amends the last commit with all staged changes and force pushes to the current branch.
+    .EXAMPLE
+        # Stage some changes first
+        git add file1.txt file2.txt
+        push
+        
+        Adds the specified files to the staging area, then amends the last commit and pushes.
+    .NOTES
+        - Requires staged files to be present; exits early if no staged changes are found
+        - Uses 'git commit --amend --no-edit' to preserve the original commit message
+        - Uses 'git push -f origin $currentBranch' for force pushing
+        - Provides colored output for success/failure status
+        - Automatically determines the current branch name
+    #>
+    $currentBranch = git branch --show-current
+    
+    # Check if there are staged files
+    $stagedFiles = git diff --cached --name-only
+    if (-not $stagedFiles) {
+        Write-Host "No staged files found. Nothing to push." -ForegroundColor Yellow
+        return
+    }
+    
+    # Prompt for commit message
+    $commitMessage = Read-Host "Commit message (press Enter to amend last commit)"
+    
+    # Create commit or amend based on user input
+    if ([string]::IsNullOrWhiteSpace($commitMessage)) {
+        # Amend the last commit with staged changes
+        git commit --amend --no-edit
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to amend commit" -ForegroundColor Red
+            return
+        }
+        Write-Host "✓ Amended last commit" -ForegroundColor Gray
+    } else {
+        # Create new commit with provided message
+        git commit -m $commitMessage
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "Failed to create commit" -ForegroundColor Red
+            return
+        }
+        Write-Host "✓ Created new commit: $commitMessage" -ForegroundColor Gray
+    }
+    
+    # Force push to remote
+    git push -f origin $currentBranch
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Failed to push to remote" -ForegroundColor Red
+        return
+    }
+    
+    Write-Host "✓ Pushed to $currentBranch" -ForegroundColor Green
+}
+
 #------------------------------------------------------------------------------
 # GIT ALIASES
 #------------------------------------------------------------------------------
@@ -627,7 +704,6 @@ function nb {
     }
     
     git checkout -b "aksingal/$branchName" origin/dev
-
     git pull
     git rebase
 }
