@@ -1008,20 +1008,6 @@ function s {
     git log -1 --oneline
 }
 
-# New branch creation alias
-function nb {
-    param([Parameter(Mandatory)]$branchName)
-    
-    if ([string]::IsNullOrWhiteSpace($branchName)) {
-        Write-Error "Branch name cannot be empty or null" -ErrorAction Stop
-        return
-    }
-    
-    git checkout -b "aksingal/$branchName" origin/dev
-    git pull
-    git rebase
-}
-
 # list work item alias
 function lwi {
     listworkitems @args
