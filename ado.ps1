@@ -7,6 +7,8 @@
 #------------------------------------------------------------------------------
 
 function Ensure-AzDevOpsLogin {
+    Write-Host "⏱ Verifying authentication..." -ForegroundColor Gray
+    
     try {
         az account show --only-show-errors | Out-Null
     }
@@ -22,6 +24,8 @@ function Ensure-AzDevOpsLogin {
         Write-Host "Azure DevOps login required. Launching az devops login..." -ForegroundColor Yellow
         az devops login | Out-Null
     }
+    
+    Write-Host "✓ User already authenticated, continuing..." -ForegroundColor Gray
 }
 
 function New-AdoWorkItem {
@@ -181,7 +185,20 @@ function New-WorkItemInternal {
 # PUBLIC WRAPPER FUNCTIONS (User-facing commands)
 #------------------------------------------------------------------------------
 
-function CreateWorkItem {
+function newbranch {
+    param([Parameter(Mandatory)]$branchName)
+    
+    if ([string]::IsNullOrWhiteSpace($branchName)) {
+        Write-Error "Branch name cannot be empty or null" -ErrorAction Stop
+        return
+    }
+    
+    git checkout -b "aksingal/$branchName" origin/dev
+    git pull
+    git rebase
+}
+
+function createworkitem {
     <#
     .SYNOPSIS
         Interactive work item creation with user prompts.
@@ -378,7 +395,7 @@ function pbi {
     New-WorkItemInternal -Kind pbi -Title $Title @PSBoundParameters
 }
 
-function pr {
+function createpr {
     <#
     .SYNOPSIS
         Creates a bug work item, commits staged files, and creates a pull request.
@@ -605,7 +622,6 @@ function pr {
     }
 }
 
-# Push staged updates to remote branch (amend last commit)
 function push {
     <#
     .SYNOPSIS
@@ -682,9 +698,307 @@ function push {
     Write-Host "✓ Pushed to $currentBranch" -ForegroundColor Green
 }
 
+# Query recent work items assigned to me with pagination
+function listworkitems {
+    <#
+    .SYNOPSIS
+        Queries and displays recent work items assigned to the current user with pagination.
+    .DESCRIPTION
+        Retrieves work items assigned to the current user, sorted by creation date (most recent first).
+        Displays results in groups of 5 items with interactive navigation.
+        
+        Navigation:
+        - Press 'n' or 'N' to view the next 5 items
+        - Press any other key to exit
+        
+        Each work item displays: ID, Title, Type, State, and Creation Date.
+    .EXAMPLE
+        listworkitems
+        
+        Displays the first 5 work items assigned to you, with option to navigate through more.
+    .EXAMPLE
+        listworkitems -Verbose
+        
+        Displays work items with detailed timing information.
+    .NOTES
+        - Uses Azure DevOps CLI (az devops) to query work items
+        - Automatically handles authentication via Ensure-AzDevOpsLogin
+        - Results are sorted by System.CreatedDate in descending order
+        - Shows work items from the 'One' project in the msazure organization
+    #>
+    [CmdletBinding()]
+    param()
+    
+    $pageSize = 5
+    $skip = 0
+    $hasMore = $true
+    
+    Write-Host "`n=== My Recent Work Items ===" -ForegroundColor Cyan
+    Write-Host ""
+    
+    while ($hasMore) {
+        try {
+            # Build WIQL query to get work items assigned to current user
+            $wiql = @"
+SELECT [System.Id], [System.Title], [System.WorkItemType], [System.State], [System.CreatedDate]
+FROM WorkItems
+WHERE [System.AssignedTo] = @Me
+ORDER BY [System.CreatedDate] DESC
+"@
+            
+            # Create JSON payload for WIQL query
+            $queryPayload = @{
+                query = $wiql
+            } | ConvertTo-Json -Depth 10
+            
+            # Create temp file for WIQL query
+            $tempFile = [System.IO.Path]::GetTempFileName()
+            $queryPayload | Out-File -FilePath $tempFile -Encoding utf8
+            
+            try {
+                if ($VerbosePreference -eq 'Continue') { Write-Host "⏱ Starting WIQL query..." -ForegroundColor Gray }
+                $queryStart = Get-Date
+                
+                $attempt = 0
+                $maxAttempts = 2
+                $queryResult = $null
+                
+                do {
+                    try {
+                        # Execute WIQL query with top 50 limit
+                        $queryResult = az devops invoke `
+                            --organization 'https://dev.azure.com/msazure' `
+                            --area wit `
+                            --resource wiql `
+                            --route-parameters "project=One" `
+                            --query-parameters '$top=50' `
+                            --http-method POST `
+                            --api-version '7.1' `
+                            --media-type 'application/json' `
+                            --in-file $tempFile `
+                            --only-show-errors | ConvertFrom-Json
+                        
+                        break
+                    }
+                    catch {
+                        if ($attempt -eq 0) {
+                            Write-Host "Auth may be expired. Attempting login..." -ForegroundColor Yellow
+                            Ensure-AzDevOpsLogin
+                        }
+                        else {
+                            throw
+                        }
+                    }
+                    
+                    $attempt++
+                }
+                while ($attempt -lt $maxAttempts)
+                
+                $queryEnd = Get-Date
+                $queryDuration = ($queryEnd - $queryStart).TotalSeconds
+                if ($VerbosePreference -eq 'Continue') { Write-Host "✓ WIQL query completed in $([math]::Round($queryDuration, 2)) seconds" -ForegroundColor Gray }
+                
+                if (-not $queryResult -or -not $queryResult.workItems) {
+                    Write-Host "No work items found assigned to you." -ForegroundColor Yellow
+                    break
+                }
+                
+                # Get the work item IDs for this page (API already limited to top 50)
+                $totalItems = $queryResult.workItems.Count
+                $pageItems = $queryResult.workItems | Select-Object -Skip $skip -First $pageSize
+                
+                if (-not $pageItems -or $pageItems.Count -eq 0) {
+                    Write-Host "No more work items to display." -ForegroundColor Yellow
+                    break
+                }
+                
+                # Get detailed work item information using batch query
+                $workItemIds = $pageItems | ForEach-Object { $_.id }
+                $idsString = $workItemIds -join ','
+                
+                if ($VerbosePreference -eq 'Continue') { Write-Host "⏱ Fetching details for $($workItemIds.Count) work items in batch..." -ForegroundColor Gray }
+                $detailsStart = Get-Date
+                
+                try {
+                    # Optimization: run individual queries in parallel using background jobs
+                    $jobs = @()
+                    foreach ($id in $workItemIds) {
+                        $jobs += Start-Job -ScriptBlock {
+                            param($id, $org)
+                            
+                            $attempt = 0
+                            $maxAttempts = 2
+                            
+                            do {
+                                try {
+                                    $result = az boards work-item show --organization $org --id $id --fields "System.Id,System.Title,System.State,System.CreatedDate" --expand none --only-show-errors -o json | ConvertFrom-Json
+                                    return $result
+                                }
+                                catch {
+                                    if ($attempt -eq 0) {
+                                        # Auth may be expired, let the parent process handle re-auth
+                                        return $null
+                                    }
+                                    else {
+                                        return $null
+                                    }
+                                }
+                                
+                                $attempt++
+                            }
+                            while ($attempt -lt $maxAttempts)
+                            
+                            return $null
+                        } -ArgumentList $id, 'https://dev.azure.com/msazure'
+                    }
+                    
+                    # Wait for all jobs to complete and collect results
+                    $workItems = @()
+                    $authRetryNeeded = $false
+                    
+                    foreach ($job in $jobs) {
+                        $result = Receive-Job -Job $job -Wait
+                        if ($result) {
+                            $workItems += $result
+                        } elseif ($result -eq $null -and -not $authRetryNeeded) {
+                            $authRetryNeeded = $true
+                        }
+                        Remove-Job -Job $job
+                    }
+                    
+                    # If some jobs failed due to auth, retry them after re-authenticating
+                    if ($authRetryNeeded -and $workItems.Count -lt $workItemIds.Count) {
+                        Write-Host "Some work items failed to load, retrying with fresh authentication..." -ForegroundColor Yellow
+                        Ensure-AzDevOpsLogin
+                        
+                        # Retry failed items
+                        $missingIds = $workItemIds | Where-Object { $_ -notin ($workItems | ForEach-Object { $_.fields.'System.Id' }) }
+                        if ($missingIds) {
+                            $retryJobs = @()
+                            foreach ($id in $missingIds) {
+                                $retryJobs += Start-Job -ScriptBlock {
+                                    param($id, $org)
+                                    try {
+                                        az boards work-item show --organization $org --id $id --fields "System.Id,System.Title,System.State,System.CreatedDate" --expand none --only-show-errors -o json | ConvertFrom-Json
+                                    }
+                                    catch {
+                                        $null
+                                    }
+                                } -ArgumentList $id, 'https://dev.azure.com/msazure'
+                            }
+                            
+                            foreach ($job in $retryJobs) {
+                                $result = Receive-Job -Job $job -Wait
+                                if ($result) {
+                                    $workItems += $result
+                                }
+                                Remove-Job -Job $job
+                            }
+                        }
+                    }
+                }
+                catch {
+                    Write-Host "Error fetching work item details: $($_.Exception.Message)" -ForegroundColor Red
+                    break
+                }
+                
+                $detailsEnd = Get-Date
+                $detailsDuration = ($detailsEnd - $detailsStart).TotalSeconds
+                if ($VerbosePreference -eq 'Continue') { Write-Host "✓ All work item details fetched in $([math]::Round($detailsDuration, 2)) seconds" -ForegroundColor Gray }
+                
+                # Display work items
+                $currentPage = [Math]::Floor($skip / $pageSize) + 1
+                $startItem = $skip + 1
+                $endItem = [Math]::Min($skip + $pageSize, $totalItems)
+                
+                Write-Host "Page $currentPage - Showing $startItem-$endItem of $totalItems work items:" -ForegroundColor White
+                Write-Host ("=" * 80) -ForegroundColor DarkGray
+                
+                foreach ($item in $workItems) {
+                    if (-not $item -or -not $item.fields) {
+                        continue
+                    }
+                    
+                    $fields = $item.fields
+                    $createdDate = [DateTime]::Parse($fields.'System.CreatedDate').ToString("MM/dd/yyyy")
+                    
+                    # First line: #ID: Title
+                    Write-Host "#" -NoNewline -ForegroundColor Gray
+                    Write-Host $fields.'System.Id' -NoNewline -ForegroundColor White
+                    Write-Host ": " -NoNewline -ForegroundColor Gray
+                    Write-Host $fields.'System.Title' -ForegroundColor White
+                    
+                    # Second line: State | Created
+                    Write-Host "State: " -NoNewline -ForegroundColor Gray
+                    
+                    # Color code the state based on value
+                    $stateColor = switch ($fields.'System.State') {
+                        'In Review' { 'DarkYellow' }
+                        'Resolved'  { 'Green' }
+                        'Done'  { 'Green' }
+                        'Removed'  { 'Gray' }
+                        default     { 'Red' }
+                    }
+                    
+                    Write-Host $fields.'System.State' -NoNewline -ForegroundColor $stateColor
+                    Write-Host " | Created: " -NoNewline -ForegroundColor Gray
+                    Write-Host $createdDate -ForegroundColor Yellow
+                    
+                    # Third line: URL
+                    Write-Host "URL: " -NoNewline -ForegroundColor Gray
+                    Write-Host "https://msazure.visualstudio.com/One/_workitems/edit/$($fields.'System.Id')" -ForegroundColor Blue
+                    
+                    Write-Host ""
+                }
+                
+                # Check if there are more items
+                $hasMore = ($skip + $pageSize) -lt $totalItems
+                
+                if ($hasMore) {
+                    Write-Host ("=" * 80) -ForegroundColor DarkGray
+                    Write-Host "Press 'n' for next page, any other key to exit: " -NoNewline -ForegroundColor Yellow
+                    $key = $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown").Character.ToString().ToLower()
+                    Write-Host $key -ForegroundColor White
+                    
+                    if ($key -eq 'n') {
+                        $skip += $pageSize
+                        Write-Host ""
+                    } else {
+                        Write-Host "Exiting..." -ForegroundColor Gray
+                        $hasMore = $false
+                    }
+                } else {
+                    Write-Host ("=" * 80) -ForegroundColor DarkGray
+                    Write-Host "End of results. Press any key to exit: " -NoNewline -ForegroundColor Yellow
+                    $Host.UI.RawUI.ReadKey("NoEcho,IncludeKeyDown") | Out-Null
+                    Write-Host ""
+                    $hasMore = $false
+                }
+            }
+            finally {
+                Remove-Item $tempFile -ErrorAction SilentlyContinue
+            }
+        }
+        catch {
+            Write-Host "Error retrieving work items: $($_.Exception.Message)" -ForegroundColor Red
+            break
+        }
+    }
+}
+
 #------------------------------------------------------------------------------
-# GIT ALIASES
+# ALIASES
 #------------------------------------------------------------------------------
+
+# PR creation alias
+function pr {
+    createpr @args
+}
+
+# New branch creation alias
+function nb {
+    newbranch @args
+}
 
 # Quick git status alias with last commit
 function s { 
@@ -708,4 +1022,8 @@ function nb {
     git rebase
 }
 
+# list work item alias
+function lwi {
+    listworkitems @args
+}
 
