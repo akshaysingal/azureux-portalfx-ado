@@ -181,6 +181,590 @@ function New-WorkItemInternal {
     New-AdoWorkItem -Type $typeMap[$Kind] -Title $Title.Trim() -State $stateMap[$stateKey] -QuietlyReturn:$false
 }
 
+function Invoke-WithSpinner {
+    <#
+    .SYNOPSIS
+        Executes a script block in the background while showing a spinning animation.
+    .DESCRIPTION
+        Runs the provided script block as a background job and displays a spinning animation
+        with the specified message until the job completes.
+    .PARAMETER ScriptBlock
+        The script block to execute in the background.
+    .PARAMETER ArgumentList
+        Arguments to pass to the script block.
+    .PARAMETER Message
+        The message to display with the spinner (e.g., "Loading data").
+    .EXAMPLE
+        $result = Invoke-WithSpinner -ScriptBlock { Get-Process } -Message "Loading processes"
+    .EXAMPLE
+        $result = Invoke-WithSpinner -ScriptBlock { param($name) Get-Service $name } -ArgumentList "Spooler" -Message "Getting service"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ScriptBlock] $ScriptBlock,
+        
+        [Parameter()]
+        [Object[]] $ArgumentList = @(),
+        
+        [Parameter(Mandatory)]
+        [string] $Message
+    )
+    
+    try {
+        # Start spinner animation
+        $spinnerChars = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+        $spinnerIndex = 0
+        
+        # Start background job
+        $job = Start-Job -ScriptBlock $ScriptBlock -ArgumentList $ArgumentList
+        
+        # Show spinner while job is running
+        while ($job.State -eq 'Running') {
+            $spinner = $spinnerChars[$spinnerIndex % $spinnerChars.Length]
+            Write-Host "`r$spinner $Message... " -NoNewline -ForegroundColor Yellow
+            $spinnerIndex++
+            Start-Sleep -Milliseconds 100
+        }
+        
+        # Get the result and clean up
+        $result = Receive-Job -Job $job
+        Remove-Job -Job $job
+        
+        return $result
+    }
+    catch {
+        # Clean up job if something goes wrong
+        if ($job) {
+            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
+        }
+        throw
+    }
+}
+
+# Global variables to store the extension caches
+$script:ExtensionCache = $null
+$script:ExtensionCacheByOAuthClientId = $null
+$script:InitializedClouds = @{}
+
+function Initialize-ExtensionCache {
+    <#
+    .SYNOPSIS
+        Reads all appsettings.{cloud}.json files and caches Service.HostingService.Extensions data.
+    .DESCRIPTION
+        Fetches all appsettings.{cloud}.json files from the AzureUX-ExtensionStudio repository,
+        extracts the Service.HostingService.Extensions arrays, and creates an in-memory lookup
+        map indexed by PortalName and cloud for fast retrieval.
+    .PARAMETER Silent
+        When specified, runs without any console output for background initialization.
+    .PARAMETER IsRefresh
+        When specified, changes output messages to use "refresh" terminology instead of "initialize".
+    .PARAMETER CloudsToInitialize
+        Specific clouds to initialize. If not provided, will initialize only missing clouds.
+    .EXAMPLE
+        Initialize-ExtensionCache
+        
+        Loads and caches missing extension data from cloud configurations.
+    .EXAMPLE
+        Initialize-ExtensionCache -Silent
+        
+        Loads missing cache silently without any output.
+    .EXAMPLE
+        Initialize-ExtensionCache -CloudsToInitialize @('production', 'fairfax')
+        
+        Loads only the specified clouds.
+    .NOTES
+        - Caches data in the script-scoped $ExtensionCache and $ExtensionCacheByOAuthClientId variables
+        - Uses Azure DevOps CLI to fetch the file content
+        - Creates nested hashtables with PortalName/OAuthClientId as key and cloud as subkey
+        - Only initializes clouds that haven't been loaded yet unless specifically requested
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [switch] $Silent,
+        
+        [Parameter()]
+        [switch] $IsRefresh,
+        
+        [Parameter()]
+        [string[]] $CloudsToInitialize
+    )
+    
+    try {
+        # Initialize global caches if they don't exist
+        if (-not $script:ExtensionCache) { $script:ExtensionCache = @{} }
+        if (-not $script:ExtensionCacheByOAuthClientId) { $script:ExtensionCacheByOAuthClientId = @{} }
+        if (-not $script:InitializedClouds) { $script:InitializedClouds = @{} }
+        
+        # Define all available clouds
+        $allClouds = @('production', 'fairfax', 'mooncake', 'bleu', 'usnat', 'ussec', 'delos', 'dogfood')
+        
+        # Determine which clouds to process
+        if ($CloudsToInitialize) {
+            # Use specified clouds (validate they're valid)
+            $cloudsToProcess = $CloudsToInitialize | Where-Object { $_ -in $allClouds }
+            if ($IsRefresh) {
+                # For refresh, reinitialize even if already loaded
+                $finalClouds = $cloudsToProcess
+            } else {
+                # For normal initialization, only process clouds that aren't already initialized
+                $finalClouds = $cloudsToProcess | Where-Object { -not $script:InitializedClouds.ContainsKey($_) }
+            }
+        } else {
+            # No specific clouds provided - determine missing clouds
+            if ($IsRefresh) {
+                # For refresh, process all clouds
+                $finalClouds = $allClouds
+                # Clear existing initialization tracking for refresh
+                $script:InitializedClouds = @{}
+            } else {
+                # For normal initialization, only process missing clouds
+                $finalClouds = $allClouds | Where-Object { -not $script:InitializedClouds.ContainsKey($_) }
+            }
+        }
+        
+        # Early exit if no clouds need processing
+        if ($finalClouds.Count -eq 0) {
+            if (-not $Silent) {
+                Write-Host "✓ All requested clouds already initialized" -ForegroundColor Green
+            }
+            return 0
+        }
+        $totalExtensions = 0
+        $successfulClouds = @()
+        $failedClouds = @()
+        
+        if (-not $Silent) {
+            Write-Host "Downloading and caching extension configuration for clouds: $($finalClouds -join ', ')..." -ForegroundColor Cyan
+        }
+        
+        # Start timing for overall operation
+        $overallStartTime = Get-Date
+        
+        # Start all cloud fetches in parallel using background jobs
+        $jobs = @()
+        foreach ($cloud in $finalClouds) {
+            $jobs += Start-Job -ScriptBlock {
+                param($cloud, $silent)
+                
+                $cloudStartTime = Get-Date
+                $result = @{
+                    cloud = $cloud
+                    success = $false
+                    extensions = $null
+                    extensionCount = 0
+                    error = $null
+                    duration = 0
+                }
+                
+                try {
+                    $errorRedirect = if ($silent) { '2>$null' } else { '' }
+                    $command = "az devops invoke --organization https://dev.azure.com/msazure --area git --resource items --route-parameters project=One repositoryId=AzureUX-ExtensionStudio --query-parameters path=`"/src/roles/fusionrp/appsettings.${cloud}.json`" versionDescriptor.version=main versionDescriptor.versionType=branch includeContent=true --http-method GET --only-show-errors -o json $errorRedirect"
+                    $content = Invoke-Expression $command
+                    
+                    if (-not $content) {
+                        $result.error = "fetch failed"
+                        return $result
+                    }
+                    
+                    # Parse the response and extract the content
+                    $response = $content | ConvertFrom-Json
+                    $fileContent = $response.content
+                    
+                    if (-not $fileContent) {
+                        $result.error = "no content"
+                        return $result
+                    }
+                    
+                    # Parse the JSON content
+                    $appSettings = $fileContent | ConvertFrom-Json
+                    
+                    # Navigate to Service.HostingService.Extensions
+                    $extensions = $appSettings.Service.HostingService.Extensions
+                    
+                    if (-not $extensions) {
+                        $result.error = "no extensions"
+                        return $result
+                    }
+                    
+                    $result.success = $true
+                    $result.extensions = $extensions
+                    $result.extensionCount = $extensions.Count
+                    
+                    return $result
+                }
+                catch {
+                    $result.error = $_.Exception.Message
+                    return $result
+                }
+                finally {
+                    $cloudEndTime = Get-Date
+                    $result.duration = ($cloudEndTime - $cloudStartTime).TotalSeconds
+                }
+            } -ArgumentList $cloud, $Silent
+        }
+        
+        # Show progress while jobs are running
+        if (-not $Silent) {
+            $spinnerChars = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+            $spinnerIndex = 0
+            
+            while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -gt 0) {
+                $spinner = $spinnerChars[$spinnerIndex % $spinnerChars.Length]
+                $completedCount = ($jobs | Where-Object { $_.State -eq 'Completed' }).Count
+                Write-Host "`r$spinner Fetching $($finalClouds.Count) clouds in parallel... ($completedCount/$($finalClouds.Count) complete)" -NoNewline -ForegroundColor Yellow
+                $spinnerIndex++
+                Start-Sleep -Milliseconds 100
+            }
+            # Clear the progress line completely
+            Write-Host "`r$(' ' * 80)`r" -NoNewline
+        }
+        
+        # Collect results from all jobs
+        $totalExtensions = 0
+        $successfulClouds = @()
+        $failedClouds = @()
+        
+        foreach ($job in $jobs) {
+            $result = Receive-Job -Job $job -Wait
+            Remove-Job -Job $job
+            
+            if ($result.success) {
+                # Create the nested lookup caches indexed by PortalName/OAuthClientId -> Cloud -> Extension
+                foreach ($extension in $result.extensions) {
+                    if ($extension.PortalName) {
+                        if (-not $script:ExtensionCache.ContainsKey($extension.PortalName)) {
+                            $script:ExtensionCache[$extension.PortalName] = @{}
+                        }
+                        $script:ExtensionCache[$extension.PortalName][$result.cloud] = $extension
+                    }
+                    if ($extension.OAuthClientId) {
+                        if (-not $script:ExtensionCacheByOAuthClientId.ContainsKey($extension.OAuthClientId)) {
+                            $script:ExtensionCacheByOAuthClientId[$extension.OAuthClientId] = @{}
+                        }
+                        if (-not $script:ExtensionCacheByOAuthClientId[$extension.OAuthClientId].ContainsKey($result.cloud)) {
+                            $script:ExtensionCacheByOAuthClientId[$extension.OAuthClientId][$result.cloud] = @()
+                        }
+                        $script:ExtensionCacheByOAuthClientId[$extension.OAuthClientId][$result.cloud] += $extension
+                    }
+                }
+                
+                # Mark this cloud as initialized
+                $script:InitializedClouds[$result.cloud] = $true
+                $successfulClouds += $result.cloud
+                $totalExtensions += $result.extensionCount
+                
+                # Show success for each cloud
+                if (-not $Silent) {
+                    Write-Host "✅ $($result.cloud) - $($result.extensionCount) extensions" -ForegroundColor Green
+                }
+            } else {
+                $failedClouds += $result.cloud
+                if (-not $Silent) {
+                    Write-Host "⚠️  $($result.cloud) cloud - $($result.error)" -ForegroundColor Yellow
+                }
+            }
+        }
+        
+        # Clear any remaining spinner and show final results
+        if (-not $Silent) {
+            $overallEndTime = Get-Date
+            $overallDuration = ($overallEndTime - $overallStartTime).TotalSeconds
+            $actionWord = if ($IsRefresh) { "refresh" } else { "initialization" }
+            Write-Host "✅ Extension cache $actionWord complete! [Total: $([math]::Round($overallDuration, 1))s]" -ForegroundColor Green
+            Write-Host "   ☁️  Successful clouds: $($successfulClouds.Count)/$($finalClouds.Count) ($($successfulClouds -join ', '))" -ForegroundColor Cyan
+            if ($failedClouds.Count -gt 0) {
+                Write-Host "   ⚠️  Failed clouds: $($failedClouds -join ', ')" -ForegroundColor Yellow
+            }
+            Write-Host ""
+        }
+        
+        return $totalExtensions
+    }
+    catch {
+        if (-not $Silent) {
+            $actionWord = if ($IsRefresh) { "refresh" } else { "initialize" }
+            Write-Host "❌ Failed to $actionWord extension cache: $($_.Exception.Message)" -ForegroundColor Red
+        }
+        throw
+    }
+}
+
+function Get-ExtensionDetails {
+    <#
+    .SYNOPSIS
+        Interactive extension configuration lookup tool.
+    .DESCRIPTION
+        Prompts the user for extension names or OAuthClientIds and cloud environment for each search.
+        Performs lookups against both the Extension Name cache and OAuthClientId cache across different 
+        cloud environments. Continues prompting until user presses enter to exit.
+    .PARAMETER RefreshCache
+        Forces a refresh of the cache before lookup.
+    .EXAMPLE
+        Get-ExtensionDetails
+        
+        Starts the interactive lookup session.
+    .NOTES
+        - Automatically initializes cache on first use for each cloud
+        - Searches both Extension Name and OAuthClientId caches for each input
+        - Press enter to exit the interactive session
+        - Displays full extension JSON when found
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [switch] $RefreshCache
+    )
+    
+    try {
+        Write-Host "=== Interactive Extension Lookup ===" -ForegroundColor Cyan
+        Write-Host "Enter extension name or OAuthClientId. Press ENTER to exit." -ForegroundColor Gray
+        Write-Host ""
+        
+        do {
+            # Prompt for search term
+            $searchTerm = Read-Host "Search (extension name or OAuthClientId)"
+            
+            # Check if user wants to exit (empty)
+            if ([string]::IsNullOrWhiteSpace($searchTerm)) {
+                Write-Host "Exiting extension lookup." -ForegroundColor Gray
+                break
+            }
+            
+            # Prompt for cloud with validation
+            $validClouds = @('production', 'fairfax', 'mooncake', 'bleu', 'usnat', 'ussec', 'delos', 'dogfood')
+            $cloudAcronyms = @{
+                'prod' = 'production'
+                'ff' = 'fairfax'
+                'mc' = 'mooncake'
+                'df' = 'dogfood'
+                'usnat' = 'usnat'
+                'ussec' = 'ussec'
+                'bleu' = 'bleu'
+                'delos' = 'delos'
+            }
+            do {
+                $cloud = Read-Host "Cloud: (prod(default)/ff/mc/bleu/usnat/ussec/delos/df)"
+                if ([string]::IsNullOrWhiteSpace($cloud)) {
+                    $cloud = "production"
+                    break
+                }
+                $cloud = $cloud.Trim().ToLower()
+                
+                # Check if it's an acronym and convert it
+                if ($cloudAcronyms.ContainsKey($cloud)) {
+                    $cloud = $cloudAcronyms[$cloud]
+                }
+                
+                if ($cloud -notin $validClouds) {
+                    Write-Host "Invalid cloud. Please enter one of: $($validClouds -join ', ') or their acronyms: $($cloudAcronyms.Keys -join ', ')" -ForegroundColor Red
+                    $cloud = $null
+                }
+            } while ([string]::IsNullOrWhiteSpace($cloud))
+            
+            # Initialize cache if not loaded or if refresh requested
+            if (-not $script:ExtensionCache -or -not $script:ExtensionCacheByOAuthClientId -or $RefreshCache) {
+                if ($RefreshCache) {
+                    Initialize-ExtensionCache -IsRefresh | Out-Null
+                } else {
+                    # Check if we need to initialize any clouds
+                    $allClouds = @('production', 'fairfax', 'mooncake', 'bleu', 'usnat', 'ussec', 'delos', 'dogfood')
+                    $missingClouds = $allClouds | Where-Object { -not $script:InitializedClouds.ContainsKey($_) }
+                    
+                    if ($missingClouds.Count -gt 0) {
+                        Initialize-ExtensionCache -CloudsToInitialize $missingClouds | Out-Null
+                    }
+                }
+            }
+            
+            $searchTerm = $searchTerm.Trim()
+            $extension = $null
+            $extensions = @()
+            
+            # First try Extension Name lookup
+            if ($script:ExtensionCache.ContainsKey($searchTerm) -and $script:ExtensionCache[$searchTerm].ContainsKey($cloud)) {
+                $extension = $script:ExtensionCache[$searchTerm][$cloud]
+            }
+            # Then try OAuthClientId lookup
+            elseif ($script:ExtensionCacheByOAuthClientId.ContainsKey($searchTerm) -and $script:ExtensionCacheByOAuthClientId[$searchTerm].ContainsKey($cloud)) {
+                $extensions = $script:ExtensionCacheByOAuthClientId[$searchTerm][$cloud]
+                if ($extensions.Count -eq 1) {
+                    $extension = $extensions[0]
+                    $extensions = @()
+                }
+            }
+            
+            if ($extension) {
+                # Display single extension details
+                Write-Host "=== Extension Details ($cloud cloud) ===" -ForegroundColor Cyan
+                
+                # Convert extension to JSON first
+                $jsonOutput = $extension | ConvertTo-Json -Depth 10
+                
+                # Add hyperlinks by replacing specific patterns in the JSON string
+                if ($extension.Icm.TeamId) {
+                    $teamId = $extension.Icm.TeamId
+                    $onCallLink = "https://portal.microsofticm.com/imp/v3/oncall/current?teamIds=${teamId}&scheduleType=current&shiftType=current&viewType=1"
+                    $onCallHyperlink = "`e]8;;${onCallLink}`e\`e[94mOn-call link`e[0m`e]8;;`e\"
+                    $jsonOutput = $jsonOutput -replace "(`"TeamId`":\s*)($teamId)", "`$1`$2 ($onCallHyperlink)"
+                }
+                
+                if ($extension.OAuthClientId) {
+                    $appID = $extension.OAuthClientId
+                    $appConfigLink = "https://msazure.visualstudio.com/One/_git/AAD-FirstPartyApps?path=/Customers/Configs/AppReg/${appID}"
+                    $appConfigHyperlink = "`e]8;;${appConfigLink}`e\`e[94m1P app config link`e[0m`e]8;;`e\"
+                    $jsonOutput = $jsonOutput -replace "(`"OAuthClientId`":\s*`")($appID)(`")", "`$1`$2 ($appConfigHyperlink)`$3"
+                }
+                
+                # Highlight the search term, but avoid highlighting within hyperlink escape sequences
+                $escapedSearchTerm = [regex]::Escape($searchTerm)
+                $highlightedSearchTerm = "`e[93m$searchTerm`e[0m"  # Yellow highlight
+                # Use negative lookahead/lookbehind to avoid highlighting within ANSI escape sequences
+                $jsonOutput = $jsonOutput -replace "(?<!`e\]8;;[^`e]*?)($escapedSearchTerm)(?![^`e]*?`e\\)", $highlightedSearchTerm
+                
+                # Display the JSON with embedded hyperlinks and highlighted search terms
+                Write-Host $jsonOutput -ForegroundColor White
+                
+                # Show if extension exists in other clouds
+                $otherClouds = @()
+                if ($script:ExtensionCache.ContainsKey($searchTerm)) {
+                    $otherClouds += $script:ExtensionCache[$searchTerm].Keys | Where-Object { $_ -ne $cloud }
+                }
+                elseif ($script:ExtensionCacheByOAuthClientId.ContainsKey($searchTerm)) {
+                    $otherClouds += $script:ExtensionCacheByOAuthClientId[$searchTerm].Keys | Where-Object { $_ -ne $cloud }
+                }
+                
+                if ($otherClouds.Count -gt 0) {
+                    Write-Host "💡 This extension also exists in: $($otherClouds -join ', ')" -ForegroundColor Cyan
+                    Write-Host "=== End ===" -ForegroundColor Cyan
+                }
+            }
+            elseif ($extensions.Count -gt 1) {
+                # Multiple extensions found for this OAuthClientId - display list and return to parent search
+                Write-Host "=== Multiple Extensions Found for OAuthClientId '$searchTerm' in $cloud cloud ===" -ForegroundColor Cyan
+                Write-Host ""
+                Write-Host "Found $($extensions.Count) extensions using this OAuthClientId:" -ForegroundColor White
+                Write-Host ""
+                
+                for ($i = 0; $i -lt $extensions.Count; $i++) {
+                    $ext = $extensions[$i]
+                    Write-Host "  $($i + 1). " -NoNewline -ForegroundColor Yellow
+                    Write-Host $ext.PortalName -ForegroundColor White
+                }
+                Write-Host ""
+                Write-Host "💡 Search by extension name to view specific details" -ForegroundColor Cyan
+                Write-Host "=== End ===" -ForegroundColor Cyan
+            }
+            else {
+                Write-Host "⚠ Extension '$searchTerm' not found as exact match in $cloud cloud" -ForegroundColor Yellow
+                
+                # Find similar extensions using substring and left-match criteria
+                $suggestions = @()
+                $searchLower = $searchTerm.ToLower()
+                
+                # Get all unique extension names from both caches that exist in this cloud
+                $allExtensionNames = @()
+                
+                # Add extension names from ExtensionCache
+                if ($script:ExtensionCache -and $script:ExtensionCache.Count -gt 0) {
+                    foreach ($extensionName in $script:ExtensionCache.Keys) {
+                        try {
+                            if ($script:ExtensionCache[$extensionName].ContainsKey($cloud) -and 
+                                $extensionName -and
+                                $extensionName.GetType() -eq [string] -and
+                                $extensionName.Length -gt 1) {
+                                $allExtensionNames += $extensionName
+                            }
+                        }
+                        catch {
+                            # Skip problematic entries
+                            continue
+                        }
+                    }
+                }
+                
+                # Add portal names from OAuthClientId cache
+                if ($script:ExtensionCacheByOAuthClientId -and $script:ExtensionCacheByOAuthClientId.Count -gt 0) {
+                    foreach ($oauthId in $script:ExtensionCacheByOAuthClientId.Keys) {
+                        try {
+                            if ($script:ExtensionCacheByOAuthClientId[$oauthId].ContainsKey($cloud)) {
+                                $extensionsForOAuth = $script:ExtensionCacheByOAuthClientId[$oauthId][$cloud]
+                                
+                                # Handle both single extension and array of extensions
+                                $extensionList = if ($extensionsForOAuth -is [array]) { $extensionsForOAuth } else { @($extensionsForOAuth) }
+                                
+                                foreach ($ext in $extensionList) {
+                                    if ($ext -and $ext.PortalName -and $ext.PortalName.GetType() -eq [string] -and $ext.PortalName.Length -gt 1) {
+                                        $allExtensionNames += $ext.PortalName
+                                    }
+                                }
+                            }
+                        }
+                        catch {
+                            # Skip problematic entries
+                            continue
+                        }
+                    }
+                }
+                
+                # Remove duplicates and filter out invalid entries
+                $allExtensionNames = $allExtensionNames | Where-Object { 
+                    $_ -and $_.GetType() -eq [string] -and $_.Length -gt 1 
+                } | Select-Object -Unique | Sort-Object
+                
+                if ($allExtensionNames.Count -gt 0) {
+                    # Find extensions that start with the search term (left match) - higher priority
+                    $leftMatches = $allExtensionNames | Where-Object { 
+                        try { $_.ToLower().StartsWith($searchLower) } catch { $false }
+                    }
+                    
+                    # Find extensions that contain the search term as substring
+                    $substringMatches = $allExtensionNames | Where-Object { 
+                        try { $_.ToLower().Contains($searchLower) -and -not $_.ToLower().StartsWith($searchLower) } catch { $false }
+                    }
+                    
+                    # Combine results, prioritizing left matches, then limit to 10 total
+                    $suggestions = @()
+                    if ($leftMatches -and $leftMatches.Count -gt 0) { 
+                        $suggestions += @($leftMatches)
+                    }
+                    if ($substringMatches -and $substringMatches.Count -gt 0) { 
+                        $suggestions += @($substringMatches)
+                    }
+                    
+                    # Ensure we have a proper array and limit to 10 total
+                    if ($suggestions.Count -gt 0) {
+                        $suggestions = @($suggestions | Select-Object -First 10)
+                    }
+                }
+                
+                if ($suggestions.Count -gt 0) {
+                    Write-Host ""
+                    Write-Host "Did you mean one of these (in $cloud cloud)?" -ForegroundColor Cyan
+                    Write-Host ""
+                    
+                    for ($i = 0; $i -lt $suggestions.Count; $i++) {
+                        $suggestion = $suggestions[$i]
+                        Write-Host "  $($i + 1). " -NoNewline -ForegroundColor Gray
+                        Write-Host $suggestion -ForegroundColor White
+                    }
+                }
+                else {
+                    Write-Host "No similar extension names found in $cloud cloud." -ForegroundColor Gray
+                }
+            }
+            
+            Write-Host ""
+            
+        } while ($true)
+    }
+    catch {
+        Write-Host "❌ Failed to retrieve extension data: $($_.Exception.Message)" -ForegroundColor Red
+        throw
+    }
+}
+
 #------------------------------------------------------------------------------
 # PUBLIC WRAPPER FUNCTIONS (User-facing commands)
 #------------------------------------------------------------------------------
@@ -1013,3 +1597,14 @@ function lwi {
     listworkitems @args
 }
 
+# extension details alias
+function getextensiondetails {
+    Get-ExtensionDetails @args
+}
+
+#------------------------------------------------------------------------------
+# AUTOMATIC INITIALIZATION
+#------------------------------------------------------------------------------
+
+# Initialize extension cache silently when script loads (directly in main scope)
+Initialize-ExtensionCache | Out-Null
