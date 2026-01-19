@@ -765,6 +765,163 @@ function Get-ExtensionDetails {
     }
 }
 
+function Invoke-TestRunRequest {
+    <#
+    .SYNOPSIS
+        Hardcoded PowerShell equivalent of submitTestRunRequest(data) in main.js.
+    .DESCRIPTION
+        Sends a POST to:
+          https://dev.azure.com/msazure/{projectGuid}/_apis/pipelines/{pipelineId}/runs?api-version=6.0-preview.1
+        Parses response JSON and returns it. Prints a build URL when successful.
+    #>
+
+    Ensure-AzDevOpsLogin
+
+    # --- Hardcoded constants from main.js ---
+    $Organization = 'https://dev.azure.com/msazure'
+    $ProjectGuid  = 'b32aa71e-8ed2-41b2-9d77-5bc261222004'  # AdoAzurePortalProjectGuid :contentReference[oaicite:2]{index=2}
+    $PipelineId   = '198960'                                 # AdoAzureUXPortalFxOnDemandDevCiPipelineId :contentReference[oaicite:3]{index=3}
+    $ApiVersion   = '7.1'                                    # Simplified API version without preview suffix
+
+    # Hardcoded branch for the test (change later as needed)
+    $BranchName = 'dev'
+    $RefName = "refs/heads/$BranchName"                      # matches JS: refs/heads/${branchName} :contentReference[oaicite:5]{index=5}
+
+    # --- Hardcoded request body (keep it literal for the test) ---
+    # JS sends JSON.stringify(data) with stagesToSkip/resources/variables/templateParameters :contentReference[oaicite:6]{index=6}
+    $BodyObject = [ordered]@{
+        stagesToSkip = @(
+            # Keep empty for a basic test. Later you can populate with stage names like "Optional_Tests", etc.
+        )
+        resources = @{
+            repositories = @{
+                self = @{
+                    refName = $RefName
+                }
+            }
+        }
+        variables = @{
+            CloudTestAccount = @{ value = 'azureportal' }
+            RetryOnFailureMode = @{ value = 'None' }
+
+            # For a basic test, just hardcode these as strings like the JS does ("true"/"false"). :contentReference[oaicite:7]{index=7}
+            SkipRequiredTests     = @{ value = 'false' }
+            SkipQuarantinedTests  = @{ value = 'true' }
+            SkipOptionalTests     = @{ value = 'true' }
+
+            SkipCompatTests       = @{ value = 'true' }
+            SkipControlsTests     = @{ value = 'true' }
+            SkipJcssTests         = @{ value = 'true' }
+            SkipLoginTests        = @{ value = 'true' }
+            SkipMsPortalFxTests   = @{ value = 'true' }
+            SkipOneStbTests       = @{ value = 'true' }
+            SkipOneStbTsTests     = @{ value = 'true' }
+            SkipQunitChrome       = @{ value = 'true' }
+            SkipQunitFirefoxTests = @{ value = 'true' }
+            SkipQunitTests        = @{ value = 'true' }
+            SkipSdkInstallerAuthTests = @{ value = 'true' }
+            SkipSdkInstallerTests     = @{ value = 'true' }
+            SkipShellTests            = @{ value = 'true' }
+            SkipShellTSTests          = @{ value = 'true' }
+            SkipThresholdTests        = @{ value = 'true' }
+            SkipUnitTests             = @{ value = 'true' }
+
+            SkipControlsCompat10DaysQuarantineTests  = @{ value = 'true' }
+            SkipControlsCompat30DaysQuarantineTests  = @{ value = 'true' }
+            SkipControlsCompat120DaysQuarantineTests = @{ value = 'true' }
+        }
+        templateParameters = @{
+            debug = 'False'
+            buildFlavorForTests = 'debug'
+        }
+    }
+
+    $json = $BodyObject | ConvertTo-Json -Depth 20
+
+    $tempFile = [System.IO.Path]::GetTempFileName()
+    try {
+        $json | Out-File -FilePath $tempFile -Encoding utf8
+
+        Write-Host "Submitting pipeline run request..." -ForegroundColor Cyan
+        Write-Host "Organization: $Organization" -ForegroundColor Gray
+        Write-Host "Project: $ProjectGuid" -ForegroundColor Gray
+        Write-Host "Pipeline ID: $PipelineId" -ForegroundColor Gray
+        Write-Host "API Version: $ApiVersion" -ForegroundColor Gray
+
+        # Equivalent POST to the JS URL: /_apis/pipelines/{pipelineId}/runs?api-version=6.0-preview.1 :contentReference[oaicite:8]{index=8}
+        $respJson = az devops invoke `
+            --organization $Organization `
+            --area pipelines `
+            --resource runs `
+            --route-parameters "project=$ProjectGuid" "pipelineId=$PipelineId" `
+            --http-method POST `
+            --api-version $ApiVersion `
+            --in-file $tempFile `
+            --only-show-errors `
+            -o json
+
+        Write-Host "Raw response from az devops invoke:" -ForegroundColor Gray
+        Write-Host "Response length: $($respJson.Length)" -ForegroundColor Gray
+        if (-not [string]::IsNullOrWhiteSpace($respJson)) {
+            Write-Host "Response: $respJson" -ForegroundColor Gray
+        } else {
+            Write-Host "Response: (empty)" -ForegroundColor Red
+        }
+
+        if ([string]::IsNullOrWhiteSpace($respJson)) {
+            # Try to get more detailed error information
+            Write-Host "Attempting to get error details..." -ForegroundColor Yellow
+            $errorResponse = az devops invoke `
+                --organization $Organization `
+                --area pipelines `
+                --resource runs `
+                --route-parameters "project=$ProjectGuid" "pipelineId=$PipelineId" `
+                --http-method POST `
+                --api-version $ApiVersion `
+                --in-file $tempFile `
+                -o json
+
+            if (-not [string]::IsNullOrWhiteSpace($errorResponse)) {
+                Write-Host "Error response: $errorResponse" -ForegroundColor Red
+            }
+            
+            throw "Empty response from az devops invoke. Check project GUID, pipeline ID, and permissions."
+        }
+
+        $resp = $respJson | ConvertFrom-Json
+
+        # JS expects response.id and then navigates to build results URL :contentReference[oaicite:9]{index=9}
+        if ($null -ne $resp.id) {
+            $buildUrl = "https://dev.azure.com/msazure/$ProjectGuid/_build/results?buildId=$($resp.id)"
+            Write-Host "Success. BuildId = $($resp.id)" -ForegroundColor Green
+            Write-Host $buildUrl -ForegroundColor Green
+        } else {
+            Write-Host "Request returned JSON but no .id was found." -ForegroundColor Yellow
+            $resp | ConvertTo-Json -Depth 10 | Write-Host
+        }
+
+        return $resp
+    }
+    finally {
+        Remove-Item $tempFile -ErrorAction SilentlyContinue
+    }
+}
+
+function Test-SubmitTestRunRequest {
+    <#
+    .SYNOPSIS
+        Basic test entrypoint: calls the hardcoded pipeline-run function.
+    #>
+    try {
+        Invoke-TestRunRequest | Out-Null
+    }
+    catch {
+        Write-Host "Test failed: $($_.Exception.Message)" -ForegroundColor Red
+        throw
+    }
+}
+
+
 #------------------------------------------------------------------------------
 # PUBLIC WRAPPER FUNCTIONS (User-facing commands)
 #------------------------------------------------------------------------------
@@ -1607,4 +1764,4 @@ function getextensiondetails {
 #------------------------------------------------------------------------------
 
 # Initialize extension cache silently when script loads (directly in main scope)
-Initialize-ExtensionCache | Out-Null
+#Initialize-ExtensionCache | Out-Null
