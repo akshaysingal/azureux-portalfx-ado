@@ -1,14 +1,74 @@
 #==============================================================================
-# AZURE DEVOPS WORK ITEM MANAGEMENT SCRIPT
+# AZURE DEVOPS POWERSHELL TOOLKIT
+#==============================================================================
+# 
+# DESCRIPTION:
+#   Comprehensive PowerShell toolkit for Azure DevOps operations including:
+#   - Work item management (creation, querying, lifecycle management)
+#   - Pipeline test execution with UI selection
+#   - Extension configuration lookup across multiple cloud environments
+#   - Git workflow automation (branch creation, PR management)
+#   - Authentication handling with automatic retry logic
+#
+# AUTHOR: Akshay Singal
+#
+# DEPENDENCIES:
+#   - Azure CLI (az) with DevOps extension
+#   - Git command line tools
+#   - PowerShell 5.1 or higher
+#   - Windows Forms (for UI components)
+#
+# CONFIGURATION:
+#   - Default organization: https://dev.azure.com/msazure
+#   - Default project: One
+#
+# USAGE EXAMPLES:
+#   createworkitem          # Interactive work item creation
+#   bug "Fix login issue"    # Quick bug creation
+#   runtests               # Launch test selection UI
+#   createpr               # Create work item + PR workflow
+#   listworkitems          # View assigned work items
+#   getextensiondetails    # Extension configuration lookup
+#
 #==============================================================================
 
-#------------------------------------------------------------------------------
-# HELPER FUNCTIONS (Internal use only)
-#------------------------------------------------------------------------------
+#==============================================================================
+# CORE HELPER FUNCTIONS
+#==============================================================================
+# 
+# This section contains internal helper functions that provide:
+# - Authentication management with automatic retry logic
+# - Centralized Azure DevOps API error handling
+# - Work item creation and lifecycle management
+# - Background task execution with progress indicators
+# 
+# These functions are designed for internal use by the public wrapper functions
+# and should not be called directly by end users.
+#==============================================================================
 
 function Ensure-AzDevOpsLogin {
+    <#
+    .SYNOPSIS
+        Ensures the user is authenticated with both Azure CLI and Azure DevOps CLI.
+    .DESCRIPTION
+        Verifies that the user has valid authentication tokens for both Azure CLI (az) 
+        and Azure DevOps CLI (az devops). If either authentication is missing or expired,
+        automatically prompts for login. This function is called internally by 
+        Invoke-WithAzDevOpsAuth to handle authentication failures gracefully.
+    .EXAMPLE
+        Ensure-AzDevOpsLogin
+        
+        Verifies authentication status and prompts for login if needed.
+    .NOTES
+        - Checks Azure CLI authentication with 'az account show'
+        - Checks Azure DevOps authentication with 'az devops project list'
+        - Automatically launches login prompts when authentication is required
+        - Uses --only-show-errors flag to minimize noise during verification
+    #>
     Write-Host "⏱ Verifying authentication..." -ForegroundColor Gray
     
+    # Verify Azure CLI authentication status
+    # If this fails, the user needs to run 'az login' to authenticate with Azure
     try {
         az account show --only-show-errors | Out-Null
     }
@@ -17,6 +77,8 @@ function Ensure-AzDevOpsLogin {
         az login | Out-Null
     }
 
+    # Verify Azure DevOps CLI authentication status  
+    # If this fails, the user needs to run 'az devops login' for DevOps-specific authentication
     try {
         az devops project list --only-show-errors | Out-Null
     }
@@ -28,7 +90,133 @@ function Ensure-AzDevOpsLogin {
     Write-Host "✓ User already authenticated, continuing..." -ForegroundColor Gray
 }
 
+function Invoke-WithAzDevOpsAuth {
+    <#
+    .SYNOPSIS
+        Executes a script block with automatic Azure DevOps authentication retry logic.
+    .DESCRIPTION
+        Attempts to execute the provided script block. If the operation fails due to 
+        authentication errors, it will re-authenticate using Ensure-AzDevOpsLogin and 
+        retry the operation once. This eliminates the need to call Ensure-AzDevOpsLogin 
+        manually in every function that uses Azure DevOps.
+    .PARAMETER ScriptBlock
+        The script block to execute that contains Azure DevOps operations.
+    .PARAMETER ArgumentList
+        Arguments to pass to the script block.
+    .EXAMPLE
+        $result = Invoke-WithAzDevOpsAuth -ScriptBlock { 
+            az devops project list --only-show-errors 
+        }
+    .EXAMPLE
+        $result = Invoke-WithAzDevOpsAuth -ScriptBlock { 
+            param($org, $project)
+            az devops invoke --organization $org --project $project
+        } -ArgumentList $Organization, $ProjectGuid
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [ScriptBlock] $ScriptBlock,
+        
+        [Parameter()]
+        [Object[]] $ArgumentList = @()
+    )
+    
+    try {
+        # First attempt - execute the script block
+        if ($ArgumentList.Count -gt 0) {
+            return & $ScriptBlock @ArgumentList
+        } else {
+            return & $ScriptBlock
+        }
+    }
+    catch {
+        $errorMessage = $_.Exception.Message.ToLower()
+        
+        # Enhanced authentication error detection
+        # Check if the error message contains any authentication-related keywords
+        $authKeywords = @(
+            "authentication", "unauthorized", "login", "token", "credential", 
+            "permission denied", "access denied", "401", "403", "az login", 
+            "az devops login", "not authenticated", "session has expired", 
+            "invalid_token", "token expired", "authentication required"
+        )
+        
+        $isAuthError = $authKeywords | Where-Object { $errorMessage -match $_ } | Measure-Object | ForEach-Object Count
+        $isAuthError = $isAuthError -gt 0
+        
+        if ($isAuthError) {
+            Write-Host "Authentication error detected. Re-authenticating..." -ForegroundColor Yellow
+            
+            # Re-authenticate
+            Ensure-AzDevOpsLogin
+            
+            # Retry the operation once
+            try {
+                if ($ArgumentList.Count -gt 0) {
+                    return & $ScriptBlock @ArgumentList
+                } else {
+                    return & $ScriptBlock
+                }
+            }
+            catch {
+                # If it still fails after re-auth, re-throw the error
+                throw
+            }
+        } else {
+            # Not an auth error, re-throw the original error
+            throw
+        }
+    }
+}
+
 function New-AdoWorkItem {
+    <#
+    .SYNOPSIS
+        Creates a new work item in Azure DevOps with comprehensive field mapping.
+    .DESCRIPTION
+        Creates work items (Bug, PBI, Task) in Azure DevOps using the REST API.
+        Supports all common work item fields including title, area path, iteration,
+        assignment, state, and tags. Uses JSON Patch format for API operations
+        and includes automatic authentication handling.
+    .PARAMETER Title
+        The title/summary of the work item. This is a required field.
+    .PARAMETER Type
+        Work item type (Bug, Product Backlog Item, Task). Defaults to 'Bug'.
+    .PARAMETER State
+        Initial state of the work item (New, Active, In Review, etc.). Defaults to 'Active'.
+    .PARAMETER Organization
+        Azure DevOps organization URL. Defaults to 'https://dev.azure.com/msazure'.
+    .PARAMETER Project
+        Project name within the organization. Defaults to 'One'.
+    .PARAMETER Area
+        Area path for categorizing the work item. Defaults to 'One\Azure Portal\Hubs'.
+    .PARAMETER Iteration
+        Iteration path for sprint/milestone assignment. Defaults to 'One\Krypton'.
+    .PARAMETER AssignedTo
+        Email address of the person to assign the work item to.
+    .PARAMETER Tags
+        Semicolon-separated tags for categorization. Defaults to 'autogen'.
+    .PARAMETER ApiVersion
+        Azure DevOps REST API version. Defaults to '7.1'.
+    .PARAMETER QuietlyReturn
+        When specified, suppresses console output and only returns the work item reference.
+    .OUTPUTS
+        String in format "#12345: Work Item Title"
+    .EXAMPLE
+        New-AdoWorkItem -Title "Fix login bug" -Type "Bug" -State "Active"
+        
+        Creates a new bug work item with specified title in Active state.
+    .EXAMPLE
+        $workItem = New-AdoWorkItem -Title "New feature request" -Type "Product Backlog Item" -QuietlyReturn
+        
+        Creates a PBI and returns the reference without console output.
+    .NOTES
+        - Uses JSON Patch format for Azure DevOps REST API
+        - Automatically handles authentication via Invoke-WithAzDevOpsAuth
+        - Creates temporary files for API payload (automatically cleaned up)
+        - Returns work item URL for easy access in browser
+    #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)]
@@ -65,6 +253,8 @@ function New-AdoWorkItem {
         [switch] $QuietlyReturn
     )
 
+    # Create JSON Patch payload for work item creation
+    # Azure DevOps uses RFC 6902 JSON Patch format for work item operations
     $patch = @(
         @{ op = 'add'; path = '/fields/System.Title';         value = $Title }
         @{ op = 'add'; path = '/fields/System.AreaPath';      value = $Area }
@@ -74,53 +264,40 @@ function New-AdoWorkItem {
         @{ op = 'add'; path = '/fields/System.Tags';          value = $Tags }
     ) | ConvertTo-Json -Depth 10
 
+    # Create temporary file for API payload
+    # Azure DevOps CLI requires input from file for complex JSON payloads
     $tempFile = [System.IO.Path]::GetTempFileName()
     try {
         $patch | Out-File -FilePath $tempFile -Encoding utf8
 
-        $attempt = 0
-        $maxAttempts = 2
-
-        do {
-            try {
-                $response = az devops invoke `
-                    --organization $Organization `
-                    --area wit `
-                    --resource workitems `
-                    --route-parameters "project=$Project" "type=$Type" `
-                    --http-method POST `
-                    --api-version $ApiVersion `
-                    --media-type "application/json-patch+json" `
-                    --in-file $tempFile `
-                    --only-show-errors |
-                    ConvertFrom-Json
-
-                break
-            }
-            catch {
-                if ($attempt -eq 0) {
-                    Write-Host "Auth may be expired. Attempting login..." -ForegroundColor Yellow
-                    Ensure-AzDevOpsLogin
-                }
-                else {
-                    throw
-                }
-            }
-
-            $attempt++
+        # Execute work item creation with automatic authentication handling
+        $response = Invoke-WithAzDevOpsAuth -ScriptBlock {
+            az devops invoke `
+                --organization $Organization `
+                --area wit `
+                --resource workitems `
+                --route-parameters "project=$Project" "type=$Type" `
+                --http-method POST `
+                --api-version $ApiVersion `
+                --media-type "application/json-patch+json" `
+                --in-file $tempFile `
+                --only-show-errors |
+                ConvertFrom-Json
         }
-        while ($attempt -lt $maxAttempts)
     }
     finally {
+        # Always clean up temporary file, even if operation fails
         Remove-Item $tempFile -ErrorAction SilentlyContinue
     }
 
+    # Format return value with work item ID and title
     $retVal = "#$($response.id): $($response.fields.'System.Title')"
 
     if ($QuietlyReturn) {
         return $retVal
     }
 
+    # Display success message with work item details and URL
     Write-Host "$Type $retVal ($State)" -ForegroundColor Green
     Write-Host "https://msazure.visualstudio.com/One/_workitems/edit/$($response.id)" -ForegroundColor Green
 }
@@ -242,10 +419,39 @@ function Invoke-WithSpinner {
     }
 }
 
+#==============================================================================
+# EXTENSION CONFIGURATION MANAGEMENT
+#==============================================================================
+# 
+# This section provides powerful extension configuration lookup capabilities
+# across multiple Azure cloud environments. The system maintains in-memory
+# caches of extension configurations from various appsettings.{cloud}.json
+# files in the AzureUX-ExtensionStudio repository.
+#
+# KEY FEATURES:
+# - Multi-cloud extension configuration lookup (production, fairfax, mooncake, etc.)
+# - Dual indexing: by extension name (PortalName) and OAuth Client ID
+# - Parallel fetching for optimal performance
+# - Interactive search with suggestions and partial matching
+# - Automatic cache initialization and refresh capabilities
+# - Hyperlink generation for ICM on-call and 1P app configuration
+#
+# SUPPORTED CLOUDS:
+# - production (prod) - Main production environment
+# - fairfax (ff) - US Government cloud  
+# - mooncake (mc) - China cloud
+# - bleu - French cloud
+# - usnat/ussec - Classified government clouds
+# - delos - Microsoft internal cloud
+# - dogfood (df) - Pre-production testing environment
+#
+#==============================================================================
+
 # Global variables to store the extension caches
-$script:ExtensionCache = $null
-$script:ExtensionCacheByOAuthClientId = $null
-$script:InitializedClouds = @{}
+# These provide fast O(1) lookup performance for extension configurations
+$script:ExtensionCache = $null                    # Indexed by PortalName -> Cloud -> Extension
+$script:ExtensionCacheByOAuthClientId = $null     # Indexed by OAuthClientId -> Cloud -> Extension[]
+$script:InitializedClouds = @{}                   # Tracks which clouds have been successfully loaded
 
 function Initialize-ExtensionCache {
     <#
@@ -765,6 +971,1559 @@ function Get-ExtensionDetails {
     }
 }
 
+#==============================================================================
+# 1P APP CONFIGURATION SCANNING
+#==============================================================================
+#
+# This section provides tools to scan 1P (First Party) app configurations across
+# all extensions in a given cloud environment. The scanning system allows users to
+# define criteria (exact match or CONTAINS) and evaluates each extension's 1P app
+# config against that criteria.
+#
+# KEY FEATURES:
+# - Downloads AppReg.Parameters.<cloud>.json from the AAD-FirstPartyApps repo
+# - Supports exact string match and CONTAINS array checks
+# - Deduplicates app ID downloads (many extensions share the same OAuthClientId)
+# - Parallel downloading of 1P app configs for performance
+# - Verbose diagnostic logging for troubleshooting
+# - Reports extensions that do NOT satisfy the user-defined criteria
+#
+# URL FORMAT:
+#   https://msazure.visualstudio.com/One/_git/AAD-FirstPartyApps
+#     ?path=/Customers/Configs/AppReg/{appID}/AppReg.Parameters.{cloud}.json
+#
+# CRITERIA FORMAT:
+#   Exact match:  parameters.signInAudience.value == "AzureADMultipleOrgs"
+#   Contains:     parameters.spa.value.redirectUris CONTAINS ["https://url1", "https://url2"]
+#
+#==============================================================================
+
+# Mapping from internal cloud names to the cloud name used in AppReg.Parameters.<cloud>.json file paths
+$script:CloudToAppRegFileNameMap = @{
+    'production' = 'Prod'
+    'fairfax'    = 'Fairfax'
+    'mooncake'   = 'Mooncake'
+    'bleu'       = 'Bleu'
+    'usnat'      = 'USNat'
+    'ussec'      = 'USSec'
+    'delos'      = 'Delos'
+    'dogfood'    = 'Dogfood'
+}
+
+function Get-FirstPartyAppConfig {
+    <#
+    .SYNOPSIS
+        Downloads the 1P app configuration for a given app ID and cloud from the AAD-FirstPartyApps repo.
+    .DESCRIPTION
+        Uses the Azure DevOps git API to fetch AppReg.Parameters.<cloud>.json for a specific app ID
+        from the AAD-FirstPartyApps repository. Returns the parsed JSON object or $null on failure.
+    .PARAMETER AppId
+        The OAuthClientId / App ID to look up.
+    .PARAMETER CloudFileName
+        The cloud file name suffix (e.g. 'Prod', 'Fairfax') used in AppReg.Parameters.<cloud>.json.
+    .OUTPUTS
+        PSCustomObject representing the parsed 1P app config, or $null if not found/error.
+    .EXAMPLE
+        $config = Get-FirstPartyAppConfig -AppId "00000000-0000-0000-0000-000000000000" -CloudFileName "Prod"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $AppId,
+
+        [Parameter(Mandatory)]
+        [string] $CloudFileName
+    )
+
+    $filePath = "/Customers/Configs/AppReg/$AppId/AppReg.Parameters.$CloudFileName.json"
+    Write-Host "    [FETCH] Downloading 1P app config: repo=AAD-FirstPartyApps, path=$filePath" -ForegroundColor DarkGray
+
+    try {
+        $rawOutput = az devops invoke `
+            --organization https://dev.azure.com/msazure `
+            --area git --resource items `
+            --route-parameters project=One repositoryId=AAD-FirstPartyApps `
+            --query-parameters "path=$filePath" versionDescriptor.version=master versionDescriptor.versionType=branch includeContent=true `
+            --http-method GET --only-show-errors -o json 2>&1
+
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "    [FETCH] az devops invoke failed with exit code $LASTEXITCODE for AppId=$AppId" -ForegroundColor DarkGray
+            Write-Host "    [FETCH] Output: $rawOutput" -ForegroundColor DarkGray
+            return $null
+        }
+
+        $response = $rawOutput | ConvertFrom-Json
+        $fileContent = $response.content
+
+        if (-not $fileContent) {
+            Write-Host "    [FETCH] No content in response for AppId=$AppId" -ForegroundColor DarkGray
+            return $null
+        }
+
+        $appConfig = $fileContent | ConvertFrom-Json
+        Write-Host "    [FETCH] Successfully parsed 1P app config for AppId=$AppId" -ForegroundColor DarkGray
+        return $appConfig
+    }
+    catch {
+        Write-Host "    [FETCH] Error downloading 1P app config for AppId=$AppId : $($_.Exception.Message)" -ForegroundColor DarkGray
+        return $null
+    }
+}
+
+function Resolve-JsonPropertyPath {
+    <#
+    .SYNOPSIS
+        Navigates a JSON/PSCustomObject by a dot-separated property path.
+    .DESCRIPTION
+        Traverses nested properties of a PowerShell object using a dot-separated path string.
+        Supports array indexing with bracket notation (e.g. "items[0].name").
+        Returns $null if any segment of the path does not exist.
+    .PARAMETER Object
+        The root object to navigate.
+    .PARAMETER PropertyPath
+        Dot-separated property path (e.g. "parameters.signInAudience.value").
+    .OUTPUTS
+        The value at the specified path, or $null if not found.
+    .EXAMPLE
+        $value = Resolve-JsonPropertyPath -Object $config -PropertyPath "parameters.signInAudience.value"
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $Object,
+
+        [Parameter(Mandatory)]
+        [string] $PropertyPath
+    )
+
+    $current = $Object
+    $segments = $PropertyPath.Split('.')
+
+    Write-Host "      [PATH] Resolving property path '$PropertyPath' ($($segments.Count) segments)" -ForegroundColor DarkGray
+
+    foreach ($segment in $segments) {
+        if ($null -eq $current) {
+            Write-Host "      [PATH] Hit null at segment '$segment'" -ForegroundColor DarkGray
+            return $null
+        }
+
+        # Handle array indexing like property[0]
+        if ($segment -match '^(.+)\[(\d+)\]$') {
+            $propName = $Matches[1]
+            $index = [int]$Matches[2]
+
+            Write-Host "      [PATH] Navigating '$propName' then index [$index]" -ForegroundColor DarkGray
+
+            $current = $current.$propName
+            if ($null -eq $current) {
+                Write-Host "      [PATH] Property '$propName' is null" -ForegroundColor DarkGray
+                return $null
+            }
+            $arr = @($current)
+            if ($index -ge $arr.Count) {
+                Write-Host "      [PATH] Index $index out of range (array length: $($arr.Count))" -ForegroundColor DarkGray
+                return $null
+            }
+            $current = $arr[$index]
+        }
+        else {
+            $prev = $current
+            $current = $current.$segment
+            if ($null -eq $current) {
+                # Check if the property actually exists but has a null value vs not existing
+                $propExists = ($prev.PSObject.Properties.Name -contains $segment)
+                if ($propExists) {
+                    Write-Host "      [PATH] Property '$segment' exists but has null value" -ForegroundColor DarkGray
+                } else {
+                    Write-Host "      [PATH] Property '$segment' does NOT exist on object" -ForegroundColor DarkGray
+                    Write-Host "      [PATH] Available properties: $($prev.PSObject.Properties.Name -join ', ')" -ForegroundColor DarkGray
+                }
+                return $null
+            }
+            Write-Host "      [PATH] '$segment' => type=$($current.GetType().Name)" -ForegroundColor DarkGray
+        }
+    }
+
+    return $current
+}
+
+function Test-AppConfigCriteria {
+    <#
+    .SYNOPSIS
+        Evaluates a criteria expression against a 1P app configuration object.
+    .DESCRIPTION
+        Supports two criteria types:
+        - 'exact': checks if the property at the given path equals the expected string value
+        - 'contains': checks if the array property at the given path contains EACH of the expected values independently
+        Returns a hashtable with per-value results so that partial matches can be reported.
+    .PARAMETER AppConfig
+        The parsed 1P app configuration PSCustomObject.
+    .PARAMETER CriteriaType
+        Either 'exact' or 'contains'.
+    .PARAMETER PropertyPath
+        Dot-separated property path to evaluate (e.g. "parameters.signInAudience.value").
+    .PARAMETER ExpectedValue
+        For 'exact': a string to compare against.
+        For 'contains': an array of strings that must all be present in the array at the property path.
+    .OUTPUTS
+        Hashtable with keys:
+          - AllSatisfied: $true/$false — whether every value was found
+          - PerValue: ordered hashtable mapping each expected value to $true/$false
+    .EXAMPLE
+        $result = Test-AppConfigCriteria -AppConfig $cfg -CriteriaType 'exact' -PropertyPath 'parameters.signInAudience.value' -ExpectedValue 'AzureADMultipleOrgs'
+        $result.AllSatisfied  # $true or $false
+    .EXAMPLE
+        $result = Test-AppConfigCriteria -AppConfig $cfg -CriteriaType 'contains' -PropertyPath 'parameters.spa.value.redirectUris' -ExpectedValue @("https://url1", "https://url2")
+        $result.PerValue      # ordered hashtable: url1 -> $true, url2 -> $false
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        $AppConfig,
+
+        [Parameter(Mandatory)]
+        [ValidateSet('exact', 'contains')]
+        [string] $CriteriaType,
+
+        [Parameter(Mandatory)]
+        [string] $PropertyPath,
+
+        [Parameter(Mandatory)]
+        $ExpectedValue
+    )
+
+    Write-Host "    [EVAL] Evaluating criteria: type=$CriteriaType, path='$PropertyPath'" -ForegroundColor DarkGray
+
+    $actualValue = Resolve-JsonPropertyPath -Object $AppConfig -PropertyPath $PropertyPath
+
+    # Build the per-value results hashtable
+    $perValue = [ordered]@{}
+
+    if ($null -eq $actualValue) {
+        Write-Host "    [EVAL] Property path '$PropertyPath' resolved to null => all criteria NOT satisfied" -ForegroundColor DarkGray
+        if ($CriteriaType -eq 'exact') {
+            $perValue[$ExpectedValue] = $false
+        } else {
+            foreach ($ev in $ExpectedValue) { $perValue[$ev.Trim()] = $false }
+        }
+        return @{ AllSatisfied = $false; PerValue = $perValue }
+    }
+
+    if ($CriteriaType -eq 'exact') {
+        $actualStr = $actualValue.ToString()
+        $matched = ($actualStr -eq $ExpectedValue)
+        Write-Host "    [EVAL] Exact match: actual='$actualStr' == expected='$ExpectedValue' => $matched" -ForegroundColor DarkGray
+        $perValue[$ExpectedValue] = $matched
+        return @{ AllSatisfied = $matched; PerValue = $perValue }
+    }
+    elseif ($CriteriaType -eq 'contains') {
+        # actualValue should be an array; check each expected value independently
+        $actualArray = @($actualValue)
+        Write-Host "    [EVAL] CONTAINS check: actual array has $($actualArray.Count) items, checking for $($ExpectedValue.Count) expected values" -ForegroundColor DarkGray
+
+        $allFound = $true
+        foreach ($expected in $ExpectedValue) {
+            $trimmedExpected = $expected.Trim()
+            $found = $false
+            foreach ($item in $actualArray) {
+                if ($item.ToString().Trim() -eq $trimmedExpected) {
+                    $found = $true
+                    break
+                }
+            }
+            $perValue[$trimmedExpected] = $found
+            if ($found) {
+                Write-Host "    [EVAL]   ✓ Found: '$trimmedExpected'" -ForegroundColor DarkGray
+            } else {
+                Write-Host "    [EVAL]   ✗ NOT Found: '$trimmedExpected'" -ForegroundColor DarkGray
+                $allFound = $false
+            }
+        }
+
+        Write-Host "    [EVAL] CONTAINS result: AllSatisfied=$allFound" -ForegroundColor DarkGray
+        return @{ AllSatisfied = $allFound; PerValue = $perValue }
+    }
+
+    Write-Host "    [EVAL] Unknown criteria type '$CriteriaType' => false" -ForegroundColor DarkGray
+    return @{ AllSatisfied = $false; PerValue = $perValue }
+}
+
+function Parse-ScanCriteria {
+    <#
+    .SYNOPSIS
+        Parses a user-provided criteria string into its components.
+    .DESCRIPTION
+        Supports two formats:
+        - Exact match:  propertyPath == "value"
+        - Contains:     propertyPath CONTAINS ["value1", "value2", ...]
+        Returns a hashtable with CriteriaType, PropertyPath, and ExpectedValue.
+    .PARAMETER CriteriaString
+        The raw criteria string entered by the user.
+    .OUTPUTS
+        Hashtable with keys: CriteriaType ('exact'|'contains'), PropertyPath (string), ExpectedValue (string or string[]).
+        Returns $null if parsing fails.
+    .EXAMPLE
+        Parse-ScanCriteria 'parameters.signInAudience.value == "AzureADMultipleOrgs"'
+    .EXAMPLE
+        Parse-ScanCriteria 'parameters.spa.value.redirectUris CONTAINS ["https://url1", "https://url2"]'
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)]
+        [string] $CriteriaString
+    )
+
+    $criteria = $CriteriaString.Trim()
+    Write-Host "[PARSE] Parsing criteria: '$criteria'" -ForegroundColor DarkGray
+
+    # Try exact match format: propertyPath == "value"
+    if ($criteria -match '^\s*(.+?)\s*==\s*"(.*)"\s*$') {
+        $propertyPath = $Matches[1].Trim()
+        $expectedValue = $Matches[2]
+        Write-Host "[PARSE] Detected EXACT match criteria" -ForegroundColor DarkGray
+        Write-Host "[PARSE]   PropertyPath : $propertyPath" -ForegroundColor DarkGray
+        Write-Host "[PARSE]   ExpectedValue: $expectedValue" -ForegroundColor DarkGray
+        return @{
+            CriteriaType  = 'exact'
+            PropertyPath  = $propertyPath
+            ExpectedValue = $expectedValue
+        }
+    }
+
+    # Try contains format: propertyPath CONTAINS [...]
+    if ($criteria -match '^\s*(.+?)\s+CONTAINS\s+(\[[\s\S]*\])\s*$') {
+        $propertyPath = $Matches[1].Trim()
+        $jsonArrayStr = $Matches[2].Trim()
+        Write-Host "[PARSE] Detected CONTAINS criteria" -ForegroundColor DarkGray
+        Write-Host "[PARSE]   PropertyPath  : $propertyPath" -ForegroundColor DarkGray
+        Write-Host "[PARSE]   Raw JSON array: $jsonArrayStr" -ForegroundColor DarkGray
+
+        try {
+            $parsedArray = $jsonArrayStr | ConvertFrom-Json
+            $expectedValues = @($parsedArray)
+            Write-Host "[PARSE]   Parsed $($expectedValues.Count) expected values" -ForegroundColor DarkGray
+            foreach ($val in $expectedValues) {
+                Write-Host "[PARSE]     - '$val'" -ForegroundColor DarkGray
+            }
+            return @{
+                CriteriaType  = 'contains'
+                PropertyPath  = $propertyPath
+                ExpectedValue = $expectedValues
+            }
+        }
+        catch {
+            Write-Host "[PARSE] ❌ Failed to parse JSON array: $($_.Exception.Message)" -ForegroundColor Red
+            Write-Host "[PARSE]   Raw input was: $jsonArrayStr" -ForegroundColor Red
+            return $null
+        }
+    }
+
+    Write-Host "[PARSE] ❌ Could not parse criteria. Expected format:" -ForegroundColor Red
+    Write-Host "[PARSE]   Exact:    propertyPath == `"value`"" -ForegroundColor Yellow
+    Write-Host "[PARSE]   Contains: propertyPath CONTAINS [`"value1`", `"value2`"]" -ForegroundColor Yellow
+    return $null
+}
+
+function Invoke-FirstPartyAppScan {
+    <#
+    .SYNOPSIS
+        Scans 1P app configurations for all extensions in a cloud against user-defined criteria.
+    .DESCRIPTION
+        This function iterates through all extensions registered in a cloud-specific
+        appsettings.<cloud>.json file. For each extension that has an OAuthClientId,
+        it downloads the corresponding 1P app config (AppReg.Parameters.<cloud>.json)
+        from the AAD-FirstPartyApps repo and evaluates the user-provided criteria.
+
+        The function reports all extensions whose 1P app configs do NOT satisfy the criteria.
+
+        Two criteria formats are supported:
+        - Exact match:  propertyPath == "value"
+          e.g. parameters.signInAudience.value == "AzureADMultipleOrgs"
+
+        - Contains:     propertyPath CONTAINS ["value1", "value2"]
+          e.g. parameters.spa.value.redirectUris CONTAINS ["https://url1", "https://url2"]
+    .PARAMETER Cloud
+        The cloud to scan. If not provided, the user will be prompted.
+    .PARAMETER Criteria
+        The criteria expression string. If not provided, the user will be prompted.
+    .PARAMETER RefreshCache
+        Forces a refresh of the extension cache before scanning.
+    .PARAMETER BatchSize
+        Number of parallel app config downloads at a time. Defaults to 10.
+    .EXAMPLE
+        Invoke-FirstPartyAppScan
+        # Interactive mode - prompts for cloud and criteria
+
+    .EXAMPLE
+        Invoke-FirstPartyAppScan -Cloud 'fairfax' -Criteria 'parameters.signInAudience.value == "AzureADMultipleOrgs"'
+        # Non-interactive mode with parameters
+
+    .EXAMPLE
+        scanapps
+        # Using the short alias
+    .NOTES
+        - Requires the extension cache to be initialized (will auto-initialize if needed)
+        - Downloads are batched in parallel for performance
+        - Deduplicates app IDs (many extensions share the same OAuthClientId)
+        - Extensions without an OAuthClientId are reported separately
+        - Uses extensive logging for debugging (all lines prefixed with [tags])
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string] $Cloud,
+
+        [Parameter()]
+        [string] $Criteria,
+
+        [Parameter()]
+        [switch] $RefreshCache,
+
+        [Parameter()]
+        [int] $BatchSize = 10
+    )
+
+    try {
+        Write-Host ""
+        Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║      1P App Configuration Scanner               ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+
+        # -----------------------------------------------------------------
+        # STEP 1: Determine cloud
+        # -----------------------------------------------------------------
+        $validClouds = @('production', 'fairfax', 'mooncake', 'bleu', 'usnat', 'ussec', 'delos', 'dogfood')
+        $cloudAcronyms = @{
+            'prod' = 'production'; 'ff' = 'fairfax'; 'mc' = 'mooncake'
+            'df'   = 'dogfood';    'usnat' = 'usnat'; 'ussec' = 'ussec'
+            'bleu' = 'bleu';       'delos' = 'delos'
+        }
+
+        if (-not $Cloud) {
+            do {
+                $Cloud = Read-Host "Cloud to scan (prod(default)/ff/mc/bleu/usnat/ussec/delos/df)"
+                if ([string]::IsNullOrWhiteSpace($Cloud)) {
+                    $Cloud = 'production'
+                    break
+                }
+                $Cloud = $Cloud.Trim().ToLower()
+                if ($cloudAcronyms.ContainsKey($Cloud)) { $Cloud = $cloudAcronyms[$Cloud] }
+                if ($Cloud -notin $validClouds) {
+                    Write-Host "Invalid cloud. Valid: $($validClouds -join ', ')" -ForegroundColor Red
+                    $Cloud = $null
+                }
+            } while ([string]::IsNullOrWhiteSpace($Cloud))
+        } else {
+            $Cloud = $Cloud.Trim().ToLower()
+            if ($cloudAcronyms.ContainsKey($Cloud)) { $Cloud = $cloudAcronyms[$Cloud] }
+            if ($Cloud -notin $validClouds) {
+                Write-Host "❌ Invalid cloud '$Cloud'. Valid: $($validClouds -join ', ')" -ForegroundColor Red
+                return
+            }
+        }
+
+        Write-Host "[INFO] Selected cloud: $Cloud" -ForegroundColor Cyan
+
+        # Resolve the cloud file name for the AppReg URL
+        $cloudFileName = $script:CloudToAppRegFileNameMap[$Cloud]
+        if (-not $cloudFileName) {
+            Write-Host "❌ No AppReg file name mapping found for cloud '$Cloud'. Check `$script:CloudToAppRegFileNameMap." -ForegroundColor Red
+            return
+        }
+        Write-Host "[INFO] AppReg file name suffix: $cloudFileName (AppReg.Parameters.$cloudFileName.json)" -ForegroundColor Cyan
+
+        # -----------------------------------------------------------------
+        # STEP 2: Get criteria from user
+        # -----------------------------------------------------------------
+        if (-not $Criteria) {
+            Write-Host ""
+            Write-Host "Enter the criteria to evaluate against each extension's 1P app config." -ForegroundColor White
+            Write-Host "Supported formats:" -ForegroundColor Gray
+            Write-Host "  Exact:    propertyPath == `"value`"" -ForegroundColor Gray
+            Write-Host "  Contains: propertyPath CONTAINS [`"value1`", `"value2`"]" -ForegroundColor Gray
+            Write-Host ""
+            Write-Host "Examples:" -ForegroundColor Gray
+            Write-Host "  parameters.signInAudience.value == `"AzureADMultipleOrgs`"" -ForegroundColor DarkYellow
+            Write-Host "  parameters.spa.value.redirectUris CONTAINS [`"https://canary.entra.microsoft.eaglex.ic.gov/auth/login/`"]" -ForegroundColor DarkYellow
+            Write-Host ""
+            $Criteria = Read-Host "Criteria"
+        }
+
+        if ([string]::IsNullOrWhiteSpace($Criteria)) {
+            Write-Host "❌ No criteria provided. Aborting." -ForegroundColor Red
+            return
+        }
+
+        # Parse the criteria
+        $parsedCriteria = Parse-ScanCriteria -CriteriaString $Criteria
+        if (-not $parsedCriteria) {
+            Write-Host "❌ Failed to parse criteria. Aborting." -ForegroundColor Red
+            return
+        }
+
+        Write-Host "[INFO] Criteria parsed successfully: type=$($parsedCriteria.CriteriaType), path=$($parsedCriteria.PropertyPath)" -ForegroundColor Cyan
+        Write-Host ""
+
+        # -----------------------------------------------------------------
+        # STEP 3: Ensure extension cache is initialized for the selected cloud
+        # -----------------------------------------------------------------
+        Write-Host "[INFO] Ensuring extension cache is initialized for '$Cloud'..." -ForegroundColor Cyan
+
+        if ($RefreshCache) {
+            Initialize-ExtensionCache -IsRefresh -CloudsToInitialize @($Cloud) | Out-Null
+        } elseif (-not $script:InitializedClouds.ContainsKey($Cloud)) {
+            Initialize-ExtensionCache -CloudsToInitialize @($Cloud) | Out-Null
+        } else {
+            Write-Host "[INFO] Extension cache already initialized for '$Cloud'" -ForegroundColor Cyan
+        }
+
+        if (-not $script:InitializedClouds.ContainsKey($Cloud)) {
+            Write-Host "❌ Failed to initialize extension cache for '$Cloud'. Cannot proceed." -ForegroundColor Red
+            return
+        }
+
+        # -----------------------------------------------------------------
+        # STEP 4: Collect all extensions for this cloud and their unique app IDs
+        # -----------------------------------------------------------------
+        Write-Host "[INFO] Collecting extensions from cache for '$Cloud'..." -ForegroundColor Cyan
+
+        $extensionsInCloud = @()
+        $extensionsWithoutAppId = @()
+        $uniqueAppIds = @{}   # AppId -> @() list of extension names using it
+
+        foreach ($portalName in $script:ExtensionCache.Keys) {
+            if ($script:ExtensionCache[$portalName].ContainsKey($Cloud)) {
+                $ext = $script:ExtensionCache[$portalName][$Cloud]
+                $extensionsInCloud += $ext
+
+                if ($ext.OAuthClientId) {
+                    $appId = $ext.OAuthClientId
+                    if (-not $uniqueAppIds.ContainsKey($appId)) {
+                        $uniqueAppIds[$appId] = @()
+                    }
+                    $uniqueAppIds[$appId] += $portalName
+                } else {
+                    $extensionsWithoutAppId += $portalName
+                }
+            }
+        }
+
+        Write-Host "[INFO] Found $($extensionsInCloud.Count) extensions in '$Cloud'" -ForegroundColor Cyan
+        Write-Host "[INFO] $($uniqueAppIds.Count) unique OAuthClientIds to scan" -ForegroundColor Cyan
+        Write-Host "[INFO] $($extensionsWithoutAppId.Count) extensions have no OAuthClientId" -ForegroundColor Cyan
+        Write-Host ""
+
+        if ($uniqueAppIds.Count -eq 0) {
+            Write-Host "⚠ No extensions with OAuthClientId found in '$Cloud'. Nothing to scan." -ForegroundColor Yellow
+            return
+        }
+
+        # -----------------------------------------------------------------
+        # STEP 5: Download 1P app configs in parallel batches
+        # -----------------------------------------------------------------
+        Write-Host "[INFO] Downloading 1P app configs (batch size: $BatchSize)..." -ForegroundColor Cyan
+        $appConfigs = @{}     # AppId -> parsed config or $null
+        $appIdList = @($uniqueAppIds.Keys)
+        $totalAppIds = $appIdList.Count
+        $downloadedCount = 0
+        $downloadFailedCount = 0
+
+        $overallStartTime = Get-Date
+
+        for ($batchStart = 0; $batchStart -lt $totalAppIds; $batchStart += $BatchSize) {
+            $batchEnd = [math]::Min($batchStart + $BatchSize, $totalAppIds) - 1
+            $batch = $appIdList[$batchStart..$batchEnd]
+            $batchNum = [math]::Floor($batchStart / $BatchSize) + 1
+            $totalBatches = [math]::Ceiling($totalAppIds / $BatchSize)
+
+            Write-Host ""
+            Write-Host "[BATCH $batchNum/$totalBatches] Downloading $($batch.Count) app configs (IDs $($batchStart + 1)-$($batchEnd + 1) of $totalAppIds)..." -ForegroundColor Yellow
+
+            # Start parallel jobs for this batch
+            $jobs = @()
+            foreach ($appId in $batch) {
+                Write-Host "  [JOB] Starting download for AppId=$appId (used by: $($uniqueAppIds[$appId] -join ', '))" -ForegroundColor DarkGray
+                $jobs += Start-Job -ScriptBlock {
+                    param($appId, $cloudFileName)
+
+                    $result = @{
+                        AppId   = $appId
+                        Success = $false
+                        Config  = $null
+                        Error   = $null
+                    }
+
+                    $filePath = "/Customers/Configs/AppReg/$appId/AppReg.Parameters.$cloudFileName.json"
+
+                    try {
+                        $rawOutput = az devops invoke `
+                            --organization https://dev.azure.com/msazure `
+                            --area git --resource items `
+                            --route-parameters project=One repositoryId=AAD-FirstPartyApps `
+                            --query-parameters "path=$filePath" versionDescriptor.version=master versionDescriptor.versionType=branch includeContent=true `
+                            --http-method GET --only-show-errors -o json 2>&1
+
+                        if ($LASTEXITCODE -ne 0) {
+                            $result.Error = "az devops invoke failed (exit code $LASTEXITCODE): $rawOutput"
+                            return $result
+                        }
+
+                        $response = $rawOutput | ConvertFrom-Json
+                        $fileContent = $response.content
+
+                        if (-not $fileContent) {
+                            $result.Error = "No content in response"
+                            return $result
+                        }
+
+                        $result.Config  = $fileContent | ConvertFrom-Json
+                        $result.Success = $true
+                        return $result
+                    }
+                    catch {
+                        $result.Error = $_.Exception.Message
+                        return $result
+                    }
+                } -ArgumentList $appId, $cloudFileName
+            }
+
+            # Wait for batch to complete with spinner
+            $spinnerChars = @('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+            $spinnerIndex = 0
+            while (($jobs | Where-Object { $_.State -eq 'Running' }).Count -gt 0) {
+                $spinner = $spinnerChars[$spinnerIndex % $spinnerChars.Length]
+                $completedInBatch = ($jobs | Where-Object { $_.State -eq 'Completed' }).Count
+                Write-Host "`r  $spinner Waiting for batch... ($completedInBatch/$($batch.Count) complete)" -NoNewline -ForegroundColor Yellow
+                $spinnerIndex++
+                Start-Sleep -Milliseconds 100
+            }
+            Write-Host "`r  $(' ' * 60)`r" -NoNewline
+
+            # Collect batch results
+            foreach ($job in $jobs) {
+                $result = Receive-Job -Job $job -Wait
+                Remove-Job -Job $job
+
+                $appId = $result.AppId
+                if ($result.Success) {
+                    $appConfigs[$appId] = $result.Config
+                    $downloadedCount++
+                    Write-Host "  [OK] AppId=$appId - config downloaded" -ForegroundColor Green
+                } else {
+                    $appConfigs[$appId] = $null
+                    $downloadFailedCount++
+                    Write-Host "  [FAIL] AppId=$appId - $($result.Error)" -ForegroundColor Red
+                }
+            }
+        }
+
+        $overallEndTime = Get-Date
+        $totalDuration = ($overallEndTime - $overallStartTime).TotalSeconds
+
+        Write-Host ""
+        Write-Host "[INFO] Download complete in $([math]::Round($totalDuration, 1))s — Success: $downloadedCount, Failed: $downloadFailedCount, Total: $totalAppIds" -ForegroundColor Cyan
+        Write-Host ""
+
+        # -----------------------------------------------------------------
+        # STEP 6: Ensure ImportExcel module is available
+        # -----------------------------------------------------------------
+        Write-Host "[INFO] Checking for ImportExcel module..." -ForegroundColor Cyan
+        if (-not (Get-Module -ListAvailable -Name ImportExcel)) {
+            Write-Host "[INFO] ImportExcel module not found. Installing..." -ForegroundColor Yellow
+            try {
+                Install-Module -Name ImportExcel -Force -Scope CurrentUser -ErrorAction Stop
+                Write-Host "[INFO] ImportExcel module installed successfully." -ForegroundColor Green
+            }
+            catch {
+                Write-Host "❌ Failed to install ImportExcel module: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "   Install manually: Install-Module ImportExcel -Scope CurrentUser" -ForegroundColor Yellow
+                return
+            }
+        } else {
+            Write-Host "[INFO] ImportExcel module is available." -ForegroundColor Cyan
+        }
+        Import-Module ImportExcel -ErrorAction Stop
+
+        # -----------------------------------------------------------------
+        # STEP 7: Evaluate criteria against each extension's 1P app config
+        # -----------------------------------------------------------------
+        Write-Host "[INFO] Evaluating criteria against downloaded configs..." -ForegroundColor Cyan
+        Write-Host ""
+
+        # Build the list of column values for the spreadsheet
+        # For 'exact' criteria there is one column; for 'contains' there is one column per value
+        if ($parsedCriteria.CriteriaType -eq 'contains') {
+            $criteriaColumns = @($parsedCriteria.ExpectedValue | ForEach-Object { $_.Trim() })
+        } else {
+            $criteriaColumns = @($parsedCriteria.ExpectedValue)
+        }
+        Write-Host "[INFO] Criteria columns for spreadsheet: $($criteriaColumns.Count)" -ForegroundColor Cyan
+        foreach ($col in $criteriaColumns) { Write-Host "[INFO]   - '$col'" -ForegroundColor DarkGray }
+
+        $failedExtensions = @()     # Extensions that did NOT satisfy ALL criteria
+        $passedExtensions = @()     # Extensions that DID satisfy ALL criteria
+        $partialExtensions = @()    # Extensions that satisfied SOME criteria (contains only)
+        $errorExtensions  = @()     # Extensions where config could not be downloaded
+        $noAppIdExtensions = $extensionsWithoutAppId  # Already collected
+
+        # Rows for the Excel spreadsheet — only extensions with a successfully downloaded config
+        $excelRows = @()
+
+        $evalIndex = 0
+        foreach ($portalName in ($script:ExtensionCache.Keys | Sort-Object)) {
+            if (-not $script:ExtensionCache[$portalName].ContainsKey($Cloud)) { continue }
+            $ext = $script:ExtensionCache[$portalName][$Cloud]
+
+            if (-not $ext.OAuthClientId) { continue }
+
+            $evalIndex++
+            $appId = $ext.OAuthClientId
+            Write-Host "[$evalIndex] Evaluating: $portalName (AppId=$appId)" -ForegroundColor White
+
+            $config = $appConfigs[$appId]
+            if ($null -eq $config) {
+                Write-Host "    [SKIP] No 1P app config available (download failed or not found)" -ForegroundColor Yellow
+                $errorExtensions += @{
+                    PortalName = $portalName
+                    AppId      = $appId
+                    Reason     = 'Config download failed or not found'
+                }
+                # Excluded from Excel per user preference
+                continue
+            }
+
+            $evalResult = Test-AppConfigCriteria `
+                -AppConfig     $config `
+                -CriteriaType  $parsedCriteria.CriteriaType `
+                -PropertyPath  $parsedCriteria.PropertyPath `
+                -ExpectedValue $parsedCriteria.ExpectedValue
+
+            # Build an Excel row as an ordered hashtable
+            $row = [ordered]@{
+                'Extension'      = $portalName
+                'OAuthClientId'  = $appId
+            }
+
+            $foundCount = 0
+            $totalCount = $criteriaColumns.Count
+            foreach ($col in $criteriaColumns) {
+                $valResult = $false
+                if ($evalResult.PerValue.Contains($col)) {
+                    $valResult = $evalResult.PerValue[$col]
+                }
+                $row[$col] = if ($valResult) { '✓' } else { '✗' }
+                if ($valResult) { $foundCount++ }
+            }
+
+            # Add summary column
+            $row['Result'] = if ($evalResult.AllSatisfied) { 'PASS' } else { 'FAIL' }
+            $row['MatchCount'] = "$foundCount/$totalCount"
+
+            $excelRows += [PSCustomObject]$row
+
+            if ($evalResult.AllSatisfied) {
+                Write-Host "    ✓ PASSED ($foundCount/$totalCount)" -ForegroundColor Green
+                $passedExtensions += @{ PortalName = $portalName; AppId = $appId }
+            } elseif ($foundCount -gt 0) {
+                Write-Host "    ~ PARTIAL ($foundCount/$totalCount)" -ForegroundColor Yellow
+                $partialExtensions += @{ PortalName = $portalName; AppId = $appId; MatchCount = $foundCount; TotalCount = $totalCount }
+            } else {
+                Write-Host "    ✗ FAILED (0/$totalCount)" -ForegroundColor Red
+                $failedExtensions += @{ PortalName = $portalName; AppId = $appId }
+            }
+        }
+
+        # -----------------------------------------------------------------
+        # STEP 8: Export to Excel
+        # -----------------------------------------------------------------
+        $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+        $excelFileName = "ScanResults_${Cloud}_${timestamp}.xlsx"
+        $excelPath = Join-Path -Path (Get-Location) -ChildPath $excelFileName
+
+        Write-Host ""
+        Write-Host "[INFO] Exporting results to Excel: $excelPath" -ForegroundColor Cyan
+
+        if ($excelRows.Count -eq 0) {
+            Write-Host "⚠ No rows to export (all configs failed to download). Skipping Excel export." -ForegroundColor Yellow
+        } else {
+            try {
+                # Export with formatting
+                $excelPkg = $excelRows | Export-Excel -Path $excelPath `
+                    -WorksheetName 'ScanResults' `
+                    -AutoSize `
+                    -AutoFilter `
+                    -FreezeTopRow `
+                    -BoldTopRow `
+                    -TableName 'ScanResults' `
+                    -TableStyle Medium6 `
+                    -PassThru
+
+                $ws = $excelPkg.Workbook.Worksheets['ScanResults']
+
+                # Color-code the value cells: green for ✓, red for ✗
+                $totalRows = $excelRows.Count
+                # Columns start at 3 (A=Extension, B=OAuthClientId, then criteria columns)
+                $startCol = 3
+                $endCol = $startCol + $criteriaColumns.Count - 1
+
+                Write-Host "[INFO] Applying conditional formatting to columns $startCol..$endCol, rows 2..$($totalRows + 1)" -ForegroundColor DarkGray
+
+                for ($r = 2; $r -le ($totalRows + 1); $r++) {
+                    for ($c = $startCol; $c -le $endCol; $c++) {
+                        $cell = $ws.Cells[$r, $c]
+                        $cellValue = $cell.Text
+                        if ($cellValue -eq '✓') {
+                            $cell.Style.Font.Color.SetColor([System.Drawing.Color]::FromArgb(0, 128, 0))      # dark green
+                            $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                            $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(198, 239, 206))  # light green bg
+                        } elseif ($cellValue -eq '✗') {
+                            $cell.Style.Font.Color.SetColor([System.Drawing.Color]::FromArgb(156, 0, 6))      # dark red
+                            $cell.Style.Fill.PatternType = [OfficeOpenXml.Style.ExcelFillStyle]::Solid
+                            $cell.Style.Fill.BackgroundColor.SetColor([System.Drawing.Color]::FromArgb(255, 199, 206))  # light red bg
+                        }
+                    }
+
+                    # Also color the Result column
+                    $resultCol = $endCol + 1
+                    $resultCell = $ws.Cells[$r, $resultCol]
+                    if ($resultCell.Text -eq 'PASS') {
+                        $resultCell.Style.Font.Color.SetColor([System.Drawing.Color]::FromArgb(0, 128, 0))
+                        $resultCell.Style.Font.Bold = $true
+                    } elseif ($resultCell.Text -eq 'FAIL') {
+                        $resultCell.Style.Font.Color.SetColor([System.Drawing.Color]::FromArgb(156, 0, 6))
+                        $resultCell.Style.Font.Bold = $true
+                    }
+                }
+
+                # Center-align the checkmark columns
+                for ($c = $startCol; $c -le $endCol; $c++) {
+                    $ws.Column($c).Style.HorizontalAlignment = [OfficeOpenXml.Style.ExcelHorizontalAlignment]::Center
+                }
+
+                $excelPkg.Save()
+                $excelPkg.Dispose()
+
+                Write-Host "✅ Excel file saved: $excelPath" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "❌ Failed to export Excel: $($_.Exception.Message)" -ForegroundColor Red
+                Write-Host "    Stack: $($_.ScriptStackTrace)" -ForegroundColor DarkGray
+            }
+        }
+
+        # -----------------------------------------------------------------
+        # STEP 9: Print console summary report
+        # -----------------------------------------------------------------
+        Write-Host ""
+        Write-Host "╔══════════════════════════════════════════════════╗" -ForegroundColor Cyan
+        Write-Host "║              SCAN RESULTS SUMMARY                ║" -ForegroundColor Cyan
+        Write-Host "╚══════════════════════════════════════════════════╝" -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "Cloud     : $Cloud" -ForegroundColor White
+        Write-Host "Criteria  : $Criteria" -ForegroundColor White
+        Write-Host "Total ext : $($extensionsInCloud.Count)" -ForegroundColor White
+        Write-Host ""
+
+        # Passed
+        Write-Host "✓ PASSED ($($passedExtensions.Count) extensions satisfy ALL criteria)" -ForegroundColor Green
+        if ($passedExtensions.Count -gt 0 -and $passedExtensions.Count -le 20) {
+            foreach ($ext in ($passedExtensions | Sort-Object { $_.PortalName })) {
+                Write-Host "    $($ext.PortalName)  (AppId: $($ext.AppId))" -ForegroundColor Green
+            }
+        } elseif ($passedExtensions.Count -gt 20) {
+            Write-Host "    (Too many to list — $($passedExtensions.Count) extensions passed)" -ForegroundColor Green
+        }
+
+        # Partial (contains only)
+        if ($partialExtensions.Count -gt 0) {
+            Write-Host ""
+            Write-Host "~ PARTIAL ($($partialExtensions.Count) extensions satisfy SOME but not all criteria)" -ForegroundColor Yellow
+            foreach ($ext in ($partialExtensions | Sort-Object { $_.PortalName })) {
+                Write-Host "    $($ext.PortalName)  (AppId: $($ext.AppId)) — $($ext.MatchCount)/$($ext.TotalCount) values matched" -ForegroundColor Yellow
+            }
+        }
+
+        # Failed
+        Write-Host ""
+        Write-Host "✗ FAILED ($($failedExtensions.Count) extensions do NOT satisfy ANY criteria)" -ForegroundColor Red
+        if ($failedExtensions.Count -gt 0) {
+            foreach ($ext in ($failedExtensions | Sort-Object { $_.PortalName })) {
+                $appConfigUrl = "https://msazure.visualstudio.com/One/_git/AAD-FirstPartyApps?path=/Customers/Configs/AppReg/$($ext.AppId)/AppReg.Parameters.$cloudFileName.json"
+                Write-Host "    $($ext.PortalName)  (AppId: $($ext.AppId))" -ForegroundColor Red
+                Write-Host "      $appConfigUrl" -ForegroundColor DarkGray
+            }
+        }
+
+        # Errors
+        if ($errorExtensions.Count -gt 0) {
+            Write-Host ""
+            Write-Host "⚠ ERRORS ($($errorExtensions.Count) extensions could not be evaluated — excluded from Excel)" -ForegroundColor Yellow
+            foreach ($ext in ($errorExtensions | Sort-Object { $_.PortalName })) {
+                Write-Host "    $($ext.PortalName)  (AppId: $($ext.AppId)) — $($ext.Reason)" -ForegroundColor Yellow
+            }
+        }
+
+        # No AppId
+        if ($noAppIdExtensions.Count -gt 0) {
+            Write-Host ""
+            Write-Host "ℹ NO APP ID ($($noAppIdExtensions.Count) extensions have no OAuthClientId — skipped)" -ForegroundColor Gray
+            foreach ($name in ($noAppIdExtensions | Sort-Object)) {
+                Write-Host "    $name" -ForegroundColor Gray
+            }
+        }
+
+        Write-Host ""
+        if ($excelRows.Count -gt 0) {
+            Write-Host "📊 Results exported to: $excelPath" -ForegroundColor Cyan
+        }
+        Write-Host "Scan completed." -ForegroundColor Cyan
+
+        # Return a structured result object for programmatic use
+        return [PSCustomObject]@{
+            Cloud              = $Cloud
+            Criteria           = $Criteria
+            TotalExtensions    = $extensionsInCloud.Count
+            PassedCount        = $passedExtensions.Count
+            PartialCount       = $partialExtensions.Count
+            FailedCount        = $failedExtensions.Count
+            ErrorCount         = $errorExtensions.Count
+            NoAppIdCount       = $noAppIdExtensions.Count
+            PassedExtensions   = $passedExtensions
+            PartialExtensions  = $partialExtensions
+            FailedExtensions   = $failedExtensions
+            ErrorExtensions    = $errorExtensions
+            NoAppIdExtensions  = $noAppIdExtensions
+            ExcelPath          = if ($excelRows.Count -gt 0) { $excelPath } else { $null }
+        }
+    }
+    catch {
+        Write-Host "❌ 1P App Scan failed: $($_.Exception.Message)" -ForegroundColor Red
+        Write-Host "Stack trace: $($_.ScriptStackTrace)" -ForegroundColor DarkGray
+        throw
+    }
+}
+
+#==============================================================================
+# AZURE DEVOPS PIPELINE DEPENDENCY MAPPING
+#==============================================================================
+#
+# This section contains hardcoded dependency mappings for Azure DevOps pipeline
+# stages and jobs. These mappings represent the build and test pipeline structure
+# for the Azure Portal project, defining prerequisites and dependencies between
+# different build stages and test jobs.
+#
+# PIPELINE STRUCTURE:
+# 1. Build Stages: build_debug, build_retail, build_debug_devoptimized
+# 2. Test Stages: Required_Tests, Optional_Tests, Quarantined_Tests  
+# 3. Reporting: PublishMergedCodeCoverageReport
+# 4. Finalization: Tag_LKG_and_Merge
+#
+# DEPENDENCY FLOW:
+# Build → Tests → Coverage Report → Tag & Merge
+#
+# Each entry contains:
+# - depends_on: Array of prerequisite stages/jobs that must complete first
+# - prerequisite_for: Array of stages/jobs that depend on this one
+#
+# This data is used by pipeline orchestration tools to understand the
+# complex dependency relationships in the Azure Portal build system.
+#==============================================================================
+
+$deps = @{
+  # -------------------------
+  # TEMPLATE / EXTERNAL STAGES (present as dependencies in this YAML but defined elsewhere)
+  # -------------------------
+  'stage:build_debug' = @{
+    depends_on        = @()   # not defined here
+    prerequisite_for  = @(
+      'stage:Required_Tests',
+      'stage:Optional_Tests',
+      'stage:Quarantined_Tests',
+      'stage:Tag_LKG_and_Merge'
+    )
+  }
+
+  'stage:build_retail' = @{
+    depends_on        = @()   # not defined here
+    prerequisite_for  = @(
+      'stage:Tag_LKG_and_Merge'
+      # Also a prerequisite_for Required/Optional/Quarantined *if* buildFlavorForTests=retail,
+      # but this YAML expresses that via a parameterized dependsOn (build_${{ parameters.buildFlavorForTests }}),
+      # so we keep the concrete debug edges above and note this caveat.
+    )
+  }
+
+  'stage:build_debug_devoptimized' = @{
+    depends_on        = @()   # not referenced by explicit dependsOn in pasted snippet
+    prerequisite_for  = @()
+  }
+
+  'stage:sdl_sources' = @{
+    depends_on        = @()   # template-defined
+    prerequisite_for  = @('stage:Tag_LKG_and_Merge')
+  }
+
+  # -------------------------
+  # STAGES (explicit in YAML)
+  # -------------------------
+  'stage:Required_Tests' = @{
+    depends_on        = @('stage:build_debug')  # parameterized in YAML; assumes buildFlavorForTests=debug
+    prerequisite_for  = @(
+      'stage:PublishMergedCodeCoverageReport',
+      'stage:Tag_LKG_and_Merge'
+    )
+  }
+
+  'stage:Optional_Tests' = @{
+    depends_on        = @('stage:build_debug')  # parameterized; assumes debug
+    prerequisite_for  = @('stage:PublishMergedCodeCoverageReport')
+  }
+
+  'stage:Quarantined_Tests' = @{
+    depends_on        = @('stage:build_debug')  # parameterized; assumes debug
+    prerequisite_for  = @('stage:PublishMergedCodeCoverageReport')
+  }
+
+  'stage:PublishMergedCodeCoverageReport' = @{
+    depends_on        = @(
+      'stage:Required_Tests',
+      'stage:Optional_Tests',
+      'stage:Quarantined_Tests'
+    )
+    prerequisite_for  = @()
+  }
+
+  'stage:Tag_LKG_and_Merge' = @{
+    depends_on        = @(
+      'stage:Required_Tests',
+      'stage:sdl_sources',
+      'stage:build_debug',
+      'stage:build_retail'
+    )
+    prerequisite_for  = @()
+  }
+
+  # -------------------------
+  # JOBS — Required_Tests
+  # -------------------------
+  'stage:Required_Tests/job:RunThresholdTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunControlsTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunOneStbTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunQunitChromeTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunQunitFirefoxTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunMsPortalFxTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTsTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTSPlaywrightTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunDxTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunOneStbTsTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunUnitTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunLoginTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunControlsCompat10DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunControlsCompat30DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunControlsCompat120DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunShellCompat10DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellCompat30DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellCompat120DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunShellTSCompat10DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTSCompat30DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTSCompat120DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunShellTSPlaywrightCompat10DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunShellTSPlaywrightCompat120DaysTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunScreenshotTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunSdkv2Tests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:RunSdkv2TemplateTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  # React artifact job + dependent jobs
+  'stage:Required_Tests/job:React_View_Copy_Files' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @(
+      'stage:Required_Tests/job:AzurePortalReactViewUtCloudTests',
+      'stage:Required_Tests/job:AzurePortalHubsReactViewUtCloudTests'
+    )
+  }
+  'stage:Required_Tests/job:AzurePortalReactViewUtCloudTests' = @{
+    depends_on        = @(
+      'stage:Required_Tests',
+      'stage:Required_Tests/job:React_View_Copy_Files'
+    )
+    prerequisite_for  = @()
+  }
+  'stage:Required_Tests/job:AzurePortalHubsReactViewUtCloudTests' = @{
+    depends_on        = @(
+      'stage:Required_Tests',
+      'stage:Required_Tests/job:React_View_Copy_Files'
+    )
+    prerequisite_for  = @()
+  }
+
+  'stage:Required_Tests/job:RunReactShellTests' = @{
+    depends_on        = @('stage:Required_Tests')
+    prerequisite_for  = @()
+  }
+
+  # -------------------------
+  # JOBS — Optional_Tests
+  # -------------------------
+  'stage:Optional_Tests/job:RunSdkInstallerAuthTests' = @{
+    depends_on        = @('stage:Optional_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Optional_Tests/job:RunSdkInstallerTests' = @{
+    depends_on        = @('stage:Optional_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Optional_Tests/job:RunShellTsTestsWithCodeCoverage' = @{
+    depends_on        = @('stage:Optional_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Optional_Tests/job:RunShellTSReleaseTests' = @{
+    depends_on        = @('stage:Optional_Tests')
+    prerequisite_for  = @()
+  }
+
+  # -------------------------
+  # JOBS — Quarantined_Tests
+  # -------------------------
+  'stage:Quarantined_Tests/job:RunControlsCompat10DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunControlsCompat30DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunControlsCompat120DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellCompat10DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellCompat30DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellCompat120DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSCompat10DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSCompat30DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSCompat120DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSPlaywrightCompat10DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSPlaywrightCompat120DaysQuarantineTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunScreenshotQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunOneStbQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunLoginQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunQunitQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunQunitFirefoxQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunShellTSPlaywrightQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+  'stage:Quarantined_Tests/job:RunOneStbTSQuarantinedTests' = @{
+    depends_on        = @('stage:Quarantined_Tests')
+    prerequisite_for  = @()
+  }
+
+  # -------------------------
+  # JOBS — PublishMergedCodeCoverageReport
+  # -------------------------
+  'stage:PublishMergedCodeCoverageReport/job:PublishMergedCodeCoverageReport' = @{
+    depends_on        = @('stage:PublishMergedCodeCoverageReport')
+    prerequisite_for  = @()
+  }
+
+  # -------------------------
+  # JOBS — Tag_LKG_and_Merge
+  # -------------------------
+  'stage:Tag_LKG_and_Merge/job:TagAndMerge' = @{
+    depends_on        = @('stage:Tag_LKG_and_Merge')
+    prerequisite_for  = @()
+  }
+}
+
+#==============================================================================
+# REQUIRED TESTS JOB MAPPING
+#==============================================================================
+#
+# Comprehensive mapping of all test jobs in the Required_Tests stage.
+# This mapping provides the bridge between internal job names and 
+# user-friendly display names, along with their corresponding skip parameters.
+#
+# STRUCTURE:
+# - Key: Internal job name used in Azure DevOps pipelines
+# - displayName: Human-readable name shown in UI
+# - skipParameter: Variable name used to skip this specific test
+# - sortOrder: Display order in test selection UI (lower = higher priority)
+#
+# TEST CATEGORIES:
+# 1. Core Tests (1-13): Essential functionality tests
+# 2. Compatibility Tests (14-24): Backward compatibility verification  
+# 3. Specialized Tests (25-31): Screenshot, SDK, React components
+#
+# This mapping is used by the interactive test selection UI to present
+# tests in a logical order and map user selections to pipeline parameters.
+#==============================================================================
+
+# Hardcoded map of Required_Tests jobs from the provided YAML
+# key   = job name
+# value = @{ displayName = '...'; skipParameter = '...' }
+$RequiredTestsJobMap = @{
+  'RunThresholdTests' = @{
+    displayName   = 'Threshold Tests'
+    skipParameter = 'SkipThresholdTests'
+    sortOrder     = 1
+  }
+  'RunControlsTests' = @{
+    displayName   = 'Controls Tests'
+    skipParameter = 'SkipControlsTests'
+    sortOrder     = 2
+  }
+  'RunShellTests' = @{
+    displayName   = 'Shell Tests'
+    skipParameter = 'SkipShellTests'
+    sortOrder     = 3
+  }
+  'RunOneStbTests' = @{
+    displayName   = 'OneStb Tests'
+    skipParameter = 'SkipOneStbTests'
+    sortOrder     = 4
+  }
+  'RunQunitChromeTests' = @{
+    displayName   = 'QUnit Chrome Tests'
+    skipParameter = 'SkipQunitChrome'
+    sortOrder     = 5
+  }
+  'RunQunitFirefoxTests' = @{
+    displayName   = 'QUnit Firefox Tests'
+    skipParameter = 'SkipQunitFirefoxTests'
+    sortOrder     = 6
+  }
+  'RunMsPortalFxTests' = @{
+    displayName   = 'MsPortalFx Tests'
+    skipParameter = 'SkipMsPortalFxTests'
+    sortOrder     = 7
+  }
+  'RunShellTsTests' = @{
+    displayName   = 'ShellTS Tests'
+    skipParameter = 'SkipShellTSTests'
+    sortOrder     = 8
+  }
+  'RunShellTSPlaywrightTests' = @{
+    displayName   = 'ShellTS Playwright Tests'
+    skipParameter = 'SkipShellTSPlaywrightTests'
+    sortOrder     = 9
+  }
+  'RunDxTests' = @{
+    displayName   = 'Dx Tests'
+    skipParameter = 'SkipDxTests'
+    sortOrder     = 10
+  }
+  'RunOneStbTsTests' = @{
+    displayName   = 'OneStbTS Tests'
+    skipParameter = 'SkipOneStbTsTests'
+    sortOrder     = 11
+  }
+  'RunUnitTests' = @{
+    displayName   = 'Unit Tests'
+    skipParameter = 'SkipUnitTests'
+    sortOrder     = 12
+  }
+  'RunLoginTests' = @{
+    displayName   = 'Login Tests'
+    skipParameter = 'SkipLoginTests'
+    sortOrder     = 13
+  }
+  'RunControlsCompat10DaysTests' = @{
+    displayName   = 'Controls Compat 10d Tests'
+    skipParameter = 'SkipControlsCompat10DaysTests'
+    sortOrder     = 14
+  }
+  'RunControlsCompat30DaysTests' = @{
+    displayName   = 'Controls Compat 30d Tests'
+    skipParameter = 'SkipControlsCompat30DaysTests'
+    sortOrder     = 15
+  }
+  'RunControlsCompat120DaysTests' = @{
+    displayName   = 'Controls Compat 120d Tests'
+    skipParameter = 'SkipControlsCompat120DaysTests'
+    sortOrder     = 16
+  }
+  'RunShellCompat10DaysTests' = @{
+    displayName   = 'Shell Compat 10d Tests'
+    skipParameter = 'SkipShellCompat10DaysTests'
+    sortOrder     = 17
+  }
+  'RunShellCompat30DaysTests' = @{
+    displayName   = 'Shell Compat 30d Tests'
+    skipParameter = 'SkipShellCompat30DaysTests'
+    sortOrder     = 18
+  }
+  'RunShellCompat120DaysTests' = @{
+    displayName   = 'Shell Compat 120d Tests'
+    skipParameter = 'SkipShellCompat120DaysTests'
+    sortOrder     = 19
+  }
+  'RunShellTSCompat10DaysTests' = @{
+    displayName   = 'ShellTS Compat 10d Tests'
+    skipParameter = 'SkipShellTSCompat10DaysTests'
+    sortOrder     = 20
+  }
+  'RunShellTSCompat30DaysTests' = @{
+    displayName   = 'ShellTS Compat 30d Tests'
+    skipParameter = 'SkipShellTSCompat30DaysTests'
+    sortOrder     = 21
+  }
+  'RunShellTSCompat120DaysTests' = @{
+    displayName   = 'ShellTS Compat 120d Tests'
+    skipParameter = 'SkipShellTSCompat120DaysTests'
+    sortOrder     = 22
+  }
+  'RunShellTSPlaywrightCompat10DaysTests' = @{
+    displayName   = 'ShellTS Playwright Compat 10d Tests'
+    skipParameter = 'SkipShellTSPlaywrightCompat10DaysTests'
+    sortOrder     = 23
+  }
+  'RunShellTSPlaywrightCompat120DaysTests' = @{
+    displayName   = 'ShellTS Playwright Compat 120d Tests'
+    skipParameter = 'SkipShellTSPlaywrightCompat120DaysTests'
+    sortOrder     = 24
+  }
+  'RunScreenshotTests' = @{
+    displayName   = 'ScreenshotTests'
+    skipParameter = 'SkipScreenshotTests'
+    sortOrder     = 25
+  }
+  'RunSdkv2Tests' = @{
+    displayName   = 'SDKv2Tests'
+    skipParameter = 'SkipSdkv2Tests'
+    sortOrder     = 26
+  }
+  'RunSdkv2TemplateTests' = @{
+    displayName   = 'SDKv2TemplateTests'
+    skipParameter = 'SkipSdkv2TemplateTests'
+    sortOrder     = 27
+  }
+  'React_View_Copy_Files' = @{
+    displayName   = 'Publish Pipeline Artifact'
+    skipParameter = $null  # This job doesn't have a single skip parameter mapping
+    sortOrder     = 28
+  }
+  'RunReactShellTests' = @{
+    displayName   = 'ReactShellTests'
+    skipParameter = 'SkipReactShellTests'
+    sortOrder     = 29
+  }
+  'AzurePortalReactViewUtCloudTests' = @{
+    displayName   = 'AzurePortal-ReactView-ut-CloudTest'
+    skipParameter = 'SkipReactViewTests'
+    sortOrder     = 30
+  }
+  'AzurePortalHubsReactViewUtCloudTests' = @{
+    displayName   = 'AzurePortal-Hubs-ReactView-ut-CloudTest'
+    skipParameter = 'SkipHubsReactViewTests'
+    sortOrder     = 31
+  }
+}
+
+#==============================================================================
+# PIPELINE STAGE MAPPING
+#==============================================================================
+#
+# Defines the mapping between internal stage names and their display properties.
+# Each stage represents a major phase in the Azure Portal build pipeline.
+#
+# STAGE TYPES:
+# - Build Stages: Compile and prepare artifacts for different configurations
+# - Test Stages: Execute various test suites (required, optional, quarantined)
+# - Report Stage: Aggregate code coverage data from all test stages  
+# - Finalization: Tag successful builds and merge to main branches
+#
+# CONDITIONS:
+# Each stage includes condition logic that determines when the stage should run
+# based on pipeline variables, previous stage results, and user configuration.
+#
+#==============================================================================
+
+# Hardcoded map of stages from the provided YAML
+# key   = stage name
+# value = @{ displayName = '...'; condition = '...' }
+
+$StageMap = @{
+  'build_retail' = @{
+    displayName = 'Build (Retail)'
+    condition   = $null   # condition defined in template, not in this YAML
+  }
+  'build_debug' = @{
+    displayName = 'Build (Debug)'
+    condition   = $null   # condition defined in template
+  }
+  'build_debug_devoptimized' = @{
+    displayName = 'Build (Debug DevOptimized)'
+    condition   = $null
+  }
+  'Required_Tests' = @{
+    displayName = 'Required Tests'
+    condition   = "and(succeeded(), ne(variables['SkipRequiredTests'], 'true'))"
+  }
+  'Optional_Tests' = @{
+    displayName = 'Optional Tests'
+    condition   = "and(succeeded(), ne(variables['SkipOptionalTests'], 'true'))"
+  }
+  'Quarantined_Tests' = @{
+    displayName = 'Quarantined Tests'
+    condition   = "and(succeeded(), ne(variables['SkipQuarantinedTests'], 'true'))"
+  }
+  'PublishMergedCodeCoverageReport' = @{
+    displayName = 'Publish Merged Code Coverage Report'
+    condition   = "or(succeeded(), failed())"
+  }
+  'Tag_LKG_and_Merge' = @{
+    displayName = 'Tag LKG'
+    condition   = "or(
+      and(
+        succeeded(),
+        and(
+          or(
+            eq(variables['Build.SourceBranch'], 'refs/heads/dev'),
+            eq(variables['Build.SourceBranch'], 'refs/tags/LKG')
+          ),
+          ne(variables['SkipTagAndMerge'], 'true')
+        )
+      ),
+      eq(variables['ForceLkgTag'], 'true')
+    )"
+  }
+}
+
 function Invoke-TestRunRequest {
     <#
     .SYNOPSIS
@@ -773,9 +2532,137 @@ function Invoke-TestRunRequest {
         Sends a POST to:
           https://dev.azure.com/msazure/{projectGuid}/_apis/pipelines/{pipelineId}/runs?api-version=6.0-preview.1
         Parses response JSON and returns it. Prints a build URL when successful.
+    .PARAMETER SkipRequiredTests
+        Whether to skip required tests. Defaults to 'false'.
+    .PARAMETER SkipQuarantinedTests
+        Whether to skip quarantined tests. Defaults to 'true'.
+    .PARAMETER SkipOptionalTests
+        Whether to skip optional tests. Defaults to 'true'.
+    .PARAMETER BranchName
+        The branch name to run tests against. Defaults to 'dev'.
+    .EXAMPLE
+        Invoke-TestRunRequest -SkipRequiredTests 'true' -SkipLoginTests 'false'
+    .EXAMPLE
+        Invoke-TestRunRequest -BranchName 'main' -SkipRequiredTests 'false'
     #>
-
-    Ensure-AzDevOpsLogin
+    [CmdletBinding()]
+    param(
+        [Parameter()]
+        [string] $SkipRequiredTests = 'false',
+        
+        [Parameter()]
+        [string] $SkipQuarantinedTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipOptionalTests = 'true',
+        
+        # Individual test control parameters - these provide granular control
+        # over specific test suites within the Required_Tests stage
+        [Parameter()]
+        [string] $SkipControlsCompat10DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipControlsCompat30DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipControlsCompat120DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipControlsTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipDxTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipHubsReactViewFluentv8Tests = 'true',
+        
+        [Parameter()]
+        [string] $SkipHubsReactViewTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipLoginTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipMsPortalFxTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipOneStbTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipOneStbTsTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipQunitChrome = 'true',
+        
+        [Parameter()]
+        [string] $SkipQunitFirefoxTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipQunitTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipReactShellTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipReactViewFluentv8Tests = 'true',
+        
+        [Parameter()]
+        [string] $SkipReactViewTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipScreenshotTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellCompat10DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellCompat30DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellCompat120DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSCompat10DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSCompat30DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSCompat120DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSPlaywrightCompat10DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSPlaywrightCompat120DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSPlaywrightTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipShellTSTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipSdkv2TemplateTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipSdkv2Tests = 'true',
+        
+        [Parameter()]
+        [string] $SkipThresholdTests = 'true',
+        
+        [Parameter()]
+        [string] $SkipUnitTests = 'true',
+        
+        [Parameter()]
+        [string] $RunControlsCompat30DaysTests = 'true',
+        
+        [Parameter()]
+        [string] $BranchName = 'dev'
+    )
 
     # --- Hardcoded constants from main.js ---
     $Organization = 'https://dev.azure.com/msazure'
@@ -783,8 +2670,7 @@ function Invoke-TestRunRequest {
     $PipelineId   = '198960'                                 # AdoAzureUXPortalFxOnDemandDevCiPipelineId :contentReference[oaicite:3]{index=3}
     $ApiVersion   = '7.1'                                    # Simplified API version without preview suffix
 
-    # Hardcoded branch for the test (change later as needed)
-    $BranchName = 'dev'
+    # Build the ref name from the branch parameter
     $RefName = "refs/heads/$BranchName"                      # matches JS: refs/heads/${branchName} :contentReference[oaicite:5]{index=5}
 
     # --- Hardcoded request body (keep it literal for the test) ---
@@ -804,31 +2690,49 @@ function Invoke-TestRunRequest {
             CloudTestAccount = @{ value = 'azureportal' }
             RetryOnFailureMode = @{ value = 'None' }
 
-            # For a basic test, just hardcode these as strings like the JS does ("true"/"false"). :contentReference[oaicite:7]{index=7}
-            SkipRequiredTests     = @{ value = 'false' }
-            SkipQuarantinedTests  = @{ value = 'true' }
-            SkipOptionalTests     = @{ value = 'true' }
+            # Test control variables
+            RunControlsCompat30DaysTests = @{ value = $RunControlsCompat30DaysTests }
 
-            SkipCompatTests       = @{ value = 'true' }
-            SkipControlsTests     = @{ value = 'true' }
-            SkipJcssTests         = @{ value = 'true' }
-            SkipLoginTests        = @{ value = 'true' }
-            SkipMsPortalFxTests   = @{ value = 'true' }
-            SkipOneStbTests       = @{ value = 'true' }
-            SkipOneStbTsTests     = @{ value = 'true' }
-            SkipQunitChrome       = @{ value = 'true' }
-            SkipQunitFirefoxTests = @{ value = 'true' }
-            SkipQunitTests        = @{ value = 'true' }
-            SkipSdkInstallerAuthTests = @{ value = 'true' }
-            SkipSdkInstallerTests     = @{ value = 'true' }
-            SkipShellTests            = @{ value = 'true' }
-            SkipShellTSTests          = @{ value = 'true' }
-            SkipThresholdTests        = @{ value = 'true' }
-            SkipUnitTests             = @{ value = 'true' }
+            # Core pipeline control - determines which test stages run
+            SkipRequiredTests     = @{ value = $SkipRequiredTests }
+            SkipQuarantinedTests  = @{ value = $SkipQuarantinedTests }
+            SkipOptionalTests     = @{ value = $SkipOptionalTests }
 
-            SkipControlsCompat10DaysQuarantineTests  = @{ value = 'true' }
-            SkipControlsCompat30DaysQuarantineTests  = @{ value = 'true' }
-            SkipControlsCompat120DaysQuarantineTests = @{ value = 'true' }
+            # Individual test skip parameters (granular control within Required_Tests stage)
+            # NOTE: Some parameters are temporarily commented out as they are not settable at queue time
+            # SkipControlsCompat10DaysTests  = @{ value = $SkipControlsCompat10DaysTests }  # TODO: Temporarily commented - not settable at queue time
+            # SkipControlsCompat30DaysTests  = @{ value = $SkipControlsCompat30DaysTests }  # TODO: Temporarily commented - not settable at queue time
+            # SkipControlsCompat120DaysTests = @{ value = $SkipControlsCompat120DaysTests } # TODO: Temporarily commented - not settable at queue time
+            SkipControlsTests     = @{ value = $SkipControlsTests }
+            # SkipDxTests         = @{ value = $SkipDxTests }                               # TODO: Temporarily commented - not settable at queue time
+            # SkipHubsReactViewFluentv8Tests = @{ value = $SkipHubsReactViewFluentv8Tests } # TODO: Temporarily commented - not settable at queue time
+            # SkipHubsReactViewTests       = @{ value = $SkipHubsReactViewTests }           # TODO: Temporarily commented - not settable at queue time
+            SkipLoginTests        = @{ value = $SkipLoginTests }
+            SkipMsPortalFxTests   = @{ value = $SkipMsPortalFxTests }
+            SkipOneStbTests       = @{ value = $SkipOneStbTests }
+            SkipOneStbTsTests     = @{ value = $SkipOneStbTsTests }
+            SkipQunitChrome       = @{ value = $SkipQunitChrome }
+            SkipQunitFirefoxTests = @{ value = $SkipQunitFirefoxTests }
+            SkipQunitTests        = @{ value = $SkipQunitTests }
+            # SkipReactShellTests    = @{ value = $SkipReactShellTests }                    # TODO: Temporarily commented - not settable at queue time
+            # SkipReactViewFluentv8Tests = @{ value = $SkipReactViewFluentv8Tests }         # TODO: Temporarily commented - not settable at queue time
+            # SkipReactViewTests    = @{ value = $SkipReactViewTests }                      # TODO: Temporarily commented - not settable at queue time
+            # SkipScreenshotTests    = @{ value = $SkipScreenshotTests }                   # TODO: Temporarily commented - not settable at queue time
+            # SkipShellCompat10DaysTests = @{ value = $SkipShellCompat10DaysTests }        # TODO: Temporarily commented - not settable at queue time
+            SkipShellCompat30DaysTests = @{ value = $SkipShellCompat30DaysTests }
+            # SkipShellCompat120DaysTests = @{ value = $SkipShellCompat120DaysTests }      # TODO: Temporarily commented - not settable at queue time
+            SkipShellTests            = @{ value = $SkipShellTests }
+            # SkipShellTSCompat10DaysTests = @{ value = $SkipShellTSCompat10DaysTests }    # TODO: Temporarily commented - not settable at queue time
+            SkipShellTSCompat30DaysTests = @{ value = $SkipShellTSCompat30DaysTests }
+            # SkipShellTSCompat120DaysTests = @{ value = $SkipShellTSCompat120DaysTests }  # TODO: Temporarily commented - not settable at queue time
+            # SkipShellTSPlaywrightCompat10DaysTests = @{ value = $SkipShellTSPlaywrightCompat10DaysTests } # TODO: Temporarily commented - not settable at queue time
+            # SkipShellTSPlaywrightCompat120DaysTests = @{ value = $SkipShellTSPlaywrightCompat120DaysTests } # TODO: Temporarily commented - not settable at queue time
+            # SkipShellTSPlaywrightTests = @{ value = $SkipShellTSPlaywrightTests }        # TODO: Temporarily commented - not settable at queue time
+            SkipShellTSTests          = @{ value = $SkipShellTSTests }
+            # SkipSdkv2TemplateTests = @{ value = $SkipSdkv2TemplateTests }                # TODO: Temporarily commented - not settable at queue time
+            # SkipSdkv2Tests          = @{ value = $SkipSdkv2Tests }                       # TODO: Temporarily commented - not settable at queue time
+            SkipThresholdTests        = @{ value = $SkipThresholdTests }
+            SkipUnitTests             = @{ value = $SkipUnitTests }
         }
         templateParameters = @{
             debug = 'False'
@@ -842,36 +2746,10 @@ function Invoke-TestRunRequest {
     try {
         $json | Out-File -FilePath $tempFile -Encoding utf8
 
-        Write-Host "Submitting pipeline run request..." -ForegroundColor Cyan
-        Write-Host "Organization: $Organization" -ForegroundColor Gray
-        Write-Host "Project: $ProjectGuid" -ForegroundColor Gray
-        Write-Host "Pipeline ID: $PipelineId" -ForegroundColor Gray
-        Write-Host "API Version: $ApiVersion" -ForegroundColor Gray
-
-        # Equivalent POST to the JS URL: /_apis/pipelines/{pipelineId}/runs?api-version=6.0-preview.1 :contentReference[oaicite:8]{index=8}
-        $respJson = az devops invoke `
-            --organization $Organization `
-            --area pipelines `
-            --resource runs `
-            --route-parameters "project=$ProjectGuid" "pipelineId=$PipelineId" `
-            --http-method POST `
-            --api-version $ApiVersion `
-            --in-file $tempFile `
-            --only-show-errors `
-            -o json
-
-        Write-Host "Raw response from az devops invoke:" -ForegroundColor Gray
-        Write-Host "Response length: $($respJson.Length)" -ForegroundColor Gray
-        if (-not [string]::IsNullOrWhiteSpace($respJson)) {
-            Write-Host "Response: $respJson" -ForegroundColor Gray
-        } else {
-            Write-Host "Response: (empty)" -ForegroundColor Red
-        }
-
-        if ([string]::IsNullOrWhiteSpace($respJson)) {
-            # Try to get more detailed error information
-            Write-Host "Attempting to get error details..." -ForegroundColor Yellow
-            $errorResponse = az devops invoke `
+        # Use helper function to handle authentication automatically
+        $respJson = Invoke-WithAzDevOpsAuth -ScriptBlock {
+            # Equivalent POST to the JS URL: /_apis/pipelines/{pipelineId}/runs?api-version=6.0-preview.1 :contentReference[oaicite:8]{index=8}
+            az devops invoke `
                 --organization $Organization `
                 --area pipelines `
                 --resource runs `
@@ -879,13 +2757,14 @@ function Invoke-TestRunRequest {
                 --http-method POST `
                 --api-version $ApiVersion `
                 --in-file $tempFile `
+                --only-show-errors `
                 -o json
+        }
 
-            if (-not [string]::IsNullOrWhiteSpace($errorResponse)) {
-                Write-Host "Error response: $errorResponse" -ForegroundColor Red
-            }
-            
-            throw "Empty response from az devops invoke. Check project GUID, pipeline ID, and permissions."
+        if ([string]::IsNullOrWhiteSpace($respJson)) {
+            # Pipeline submission failed - this usually indicates authentication,
+            # permission, or configuration issues (invalid project GUID, pipeline ID, etc.)
+            throw "Pipeline submission failed. No response received."
         }
 
         $resp = $respJson | ConvertFrom-Json
@@ -893,7 +2772,6 @@ function Invoke-TestRunRequest {
         # JS expects response.id and then navigates to build results URL :contentReference[oaicite:9]{index=9}
         if ($null -ne $resp.id) {
             $buildUrl = "https://dev.azure.com/msazure/$ProjectGuid/_build/results?buildId=$($resp.id)"
-            Write-Host "Success. BuildId = $($resp.id)" -ForegroundColor Green
             Write-Host $buildUrl -ForegroundColor Green
         } else {
             Write-Host "Request returned JSON but no .id was found." -ForegroundColor Yellow
@@ -907,25 +2785,260 @@ function Invoke-TestRunRequest {
     }
 }
 
-function Test-SubmitTestRunRequest {
+function Run-OnDemandCiTestWithUi {
     <#
     .SYNOPSIS
-        Basic test entrypoint: calls the hardcoded pipeline-run function.
+        Shows a simple checkbox UI to select which tests to run.
+    .OUTPUTS
+        PSCustomObject with BranchName, Mode, SelectedTests (string[])
+        Returns $null if user cancels/closes.
+        SelectedTests will contain the underlying test keys (e.g., 'RunLoginTests') rather than display names.
     #>
-    try {
-        Invoke-TestRunRequest | Out-Null
+
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+
+    # Create test items with both display names and underlying values
+    $testItems = @()
+    foreach ($key in ($RequiredTestsJobMap.Keys | Sort-Object)) {
+        $displayName = $RequiredTestsJobMap[$key].displayName
+        $skipParameter = $RequiredTestsJobMap[$key].skipParameter
+        $sortOrder = if ($RequiredTestsJobMap[$key].sortOrder) { $RequiredTestsJobMap[$key].sortOrder } else { 999 }
+        $testItems += [PSCustomObject]@{
+            DisplayName = $displayName
+            Value = $key
+            SkipParameter = $skipParameter
+            SortOrder = $sortOrder
+        }
     }
-    catch {
-        Write-Host "Test failed: $($_.Exception.Message)" -ForegroundColor Red
-        throw
+    
+    # Sort by custom sort order, then by display name for items without sort order
+    $testItems = $testItems | Sort-Object SortOrder
+
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = "Select Tests to Run"
+    $form.Size = New-Object System.Drawing.Size(360, 520)
+    $form.StartPosition = "CenterScreen"
+    $form.TopMost = $true
+
+    # Branch label + textbox
+    $lblBranch = New-Object System.Windows.Forms.Label
+    $lblBranch.Text = "Choose your branch:"
+    $lblBranch.Location = New-Object System.Drawing.Point(12, 12)
+    $lblBranch.AutoSize = $true
+    $form.Controls.Add($lblBranch)
+
+    $txtBranch = New-Object System.Windows.Forms.TextBox
+    $txtBranch.Location = New-Object System.Drawing.Point(12, 34)
+    $txtBranch.Size = New-Object System.Drawing.Size(320, 20)
+    $txtBranch.Text = (git branch --show-current)
+    $form.Controls.Add($txtBranch)
+
+    # Mode radio buttons
+    $grpMode = New-Object System.Windows.Forms.GroupBox
+    $grpMode.Text = "Mode"
+    $grpMode.Location = New-Object System.Drawing.Point(12, 65)
+    $grpMode.Size = New-Object System.Drawing.Size(320, 55)
+    $form.Controls.Add($grpMode)
+
+    $rbBasic = New-Object System.Windows.Forms.RadioButton
+    $rbBasic.Text = "Basic"
+    $rbBasic.Location = New-Object System.Drawing.Point(12, 22)
+    $rbBasic.Checked = $true
+    $grpMode.Controls.Add($rbBasic)
+
+    $rbAdvanced = New-Object System.Windows.Forms.RadioButton
+    $rbAdvanced.Text = "Advanced"
+    $rbAdvanced.Location = New-Object System.Drawing.Point(120, 22)
+    $grpMode.Controls.Add($rbAdvanced)
+
+    # Checklist box
+    $grpTests = New-Object System.Windows.Forms.GroupBox
+    $grpTests.Text = "Tests"
+    $grpTests.Location = New-Object System.Drawing.Point(12, 130)
+    $grpTests.Size = New-Object System.Drawing.Size(320, 300)
+    $form.Controls.Add($grpTests)
+
+    $clb = New-Object System.Windows.Forms.CheckedListBox
+    $clb.Location = New-Object System.Drawing.Point(12, 22)
+    $clb.Size = New-Object System.Drawing.Size(295, 260)
+    $clb.CheckOnClick = $true
+    $clb.DisplayMember = "DisplayName"  # Show the friendly display name
+    
+    # Add the test items to the checklist
+    foreach ($item in $testItems) {
+        [void]$clb.Items.Add($item)
     }
+    
+    $grpTests.Controls.Add($clb)
+
+    # Buttons
+    $btnSubmit = New-Object System.Windows.Forms.Button
+    $btnSubmit.Text = "Submit"
+    $btnSubmit.Location = New-Object System.Drawing.Point(172, 440)
+    $btnSubmit.Size = New-Object System.Drawing.Size(75, 28)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text = "Cancel"
+    $btnCancel.Location = New-Object System.Drawing.Point(257, 440)
+    $btnCancel.Size = New-Object System.Drawing.Size(75, 28)
+
+    $form.Controls.Add($btnSubmit)
+    $form.Controls.Add($btnCancel)
+
+    $result = $null
+
+    $btnSubmit.Add_Click({
+        $branch = $txtBranch.Text.Trim()
+        if ([string]::IsNullOrWhiteSpace($branch)) {
+            [System.Windows.Forms.MessageBox]::Show("Please enter a branch name.", "Missing branch")
+            return
+        }
+
+        $mode = if ($rbAdvanced.Checked) { "Advanced" } else { "Basic" }
+
+        # Get the underlying values instead of display names
+        $selected = @()
+        foreach ($item in $clb.CheckedItems) { 
+            $selected += $item.Value  # Use the underlying test key
+        }
+        
+        # Also log to console for debugging
+        if ($selected.Count -gt 0) {
+            # Convert selected test keys to display names for better messaging
+            $displayNames = @()
+            foreach ($testKey in $selected) {
+                if ($RequiredTestsJobMap.ContainsKey($testKey)) {
+                    $displayNames += $RequiredTestsJobMap[$testKey].displayName
+                } else {
+                    $displayNames += $testKey  # Fallback to key if no display name found
+                }
+            }
+            Write-Host "Running tests: $($displayNames -join ', ') - submitting pipeline request..." -ForegroundColor Cyan
+        } else {
+            Write-Host "No tests selected" -ForegroundColor Yellow
+            return
+        }
+
+        $result = [pscustomobject]@{
+            BranchName    = $branch
+            Mode          = $mode
+            SelectedTests = $selected
+        }
+
+        # Close the form immediately after validation
+        $form.Close()
+
+        # Call Invoke-TestRunRequest with the selected parameters
+        try {
+            
+            # Start with all tests skipped by default
+            $testParams = @{
+                BranchName = $branch
+                SkipRequiredTests = 'false'  # Always run required tests stage
+                SkipQuarantinedTests = 'true'
+                SkipOptionalTests = 'true'
+                SkipCompatTests = 'true'
+                
+                # Individual test skip parameters - default to true (skip)
+                SkipControlsCompat10DaysTests = 'true'
+                SkipControlsCompat30DaysTests = 'true'
+                SkipControlsCompat120DaysTests = 'true'
+                SkipControlsTests = 'true'
+                SkipDxTests = 'true'
+                SkipHubsReactViewFluentv8Tests = 'true'
+                SkipHubsReactViewTests = 'true'
+                SkipLoginTests = 'true'
+                SkipMsPortalFxTests = 'true'
+                SkipOneStbTests = 'true'
+                SkipOneStbTsTests = 'true'
+                SkipQunitChrome = 'true'
+                SkipQunitFirefoxTests = 'true'
+                SkipQunitTests = 'true'
+                SkipReactShellTests = 'true'
+                SkipReactViewFluentv8Tests = 'true'
+                SkipReactViewTests = 'true'
+                SkipScreenshotTests = 'true'
+                SkipShellCompat10DaysTests = 'true'
+                SkipShellCompat30DaysTests = 'true'
+                SkipShellCompat120DaysTests = 'true'
+                SkipShellTests = 'true'
+                SkipShellTSCompat10DaysTests = 'true'
+                SkipShellTSCompat30DaysTests = 'true'
+                SkipShellTSCompat120DaysTests = 'true'
+                SkipShellTSPlaywrightCompat10DaysTests = 'true'
+                SkipShellTSPlaywrightCompat120DaysTests = 'true'
+                SkipShellTSPlaywrightTests = 'true'
+                SkipShellTSTests = 'true'
+                SkipSdkv2TemplateTests = 'true'
+                SkipSdkv2Tests = 'true'
+                SkipThresholdTests = 'true'
+                SkipUnitTests = 'true'
+                RunControlsCompat30DaysTests = 'true'
+            }
+
+            # For selected tests, set their skip parameters to 'false' (don't skip them)
+            foreach ($testName in $selected) {
+                if ($RequiredTestsJobMap.ContainsKey($testName) -and $RequiredTestsJobMap[$testName].skipParameter) {
+                    $skipParam = $RequiredTestsJobMap[$testName].skipParameter
+                    $testParams[$skipParam] = 'false'
+                }
+                
+                # Special handling for QUnit tests - if any QUnit test is selected, don't skip QUnit entirely
+                if ($testName -eq 'RunQunitChromeTests' -or $testName -eq 'RunQunitFirefoxTests') {
+                    $testParams['SkipQunitTests'] = 'false'
+                }
+                
+                # Special handling for compat tests - if any compat test is selected, don't skip compat entirely
+                if ($testName -match 'Compat.*Tests$') {
+                    # Note: SkipCompatTests parameter was removed as it's not needed with granular test control
+                }
+            }
+
+            # Call the function with splatting
+            Invoke-TestRunRequest @testParams
+        }
+        catch {
+            $errorMsg = "Failed to submit test run. Error: $($_.Exception.Message)"
+            Write-Host $errorMsg -ForegroundColor Red
+            [System.Windows.Forms.MessageBox]::Show($errorMsg, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        }
+    })
+
+    $btnCancel.Add_Click({
+        $result = $null
+        $form.Close()
+    })
+
+    # If user closes window via X
+    $form.Add_FormClosing({
+        if (-not $result) { $result = $null }
+    })
+
+    [void]$form.ShowDialog()
+    return $result
 }
 
-
-#------------------------------------------------------------------------------
-# PUBLIC WRAPPER FUNCTIONS (User-facing commands)
-#------------------------------------------------------------------------------
-
+#==============================================================================
+# PUBLIC WRAPPER FUNCTIONS
+#==============================================================================
+#
+# This section contains user-facing commands that provide streamlined workflows
+# for common Azure DevOps operations. These functions are designed to be:
+# - Easy to remember and type (short names, intuitive parameters)
+# - Comprehensive in functionality (handle full workflows end-to-end)  
+# - Robust with error handling and user feedback
+# - Consistent in behavior and output formatting
+#
+# MAIN CATEGORIES:
+# 1. Git Workflow: newbranch, createpr, push
+# 2. Work Item Management: createworkitem, bug, pbi, listworkitems
+# 3. Pipeline Testing: runtests (via Run-OnDemandCiTestWithUi)
+# 4. Extension Lookup: getextensiondetails
+#
+# All functions include comprehensive help documentation and examples.
+# Many support both interactive prompts and parameter-based usage.
+#==============================================================================
 function newbranch {
     param([Parameter(Mandatory)]$branchName)
     
@@ -937,6 +3050,60 @@ function newbranch {
     git checkout -b "aksingal/$branchName" origin/dev
     git pull
     git rebase
+
+    # run clean.ps1 from the repo
+    $repoRoot = git rev-parse --show-toplevel
+    if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($repoRoot)) {
+        $cleanScriptPath = Join-Path $repoRoot 'tools\PathScripts\clean.ps1'
+        if (Test-Path $cleanScriptPath) {
+            & $cleanScriptPath
+        } else {
+            Write-Warning "Clean script not found at path: $cleanScriptPath"
+        }
+    } else {
+        Write-Warning "Unable to determine repository root. Skipping clean.ps1 invocation."
+    }
+
+    # stop IIS
+    net stop w3svc
+
+    # kill common processes that might interfere with file locks or builds
+    $imageNames = @(
+        'w3wp.exe',
+        'MSBuild.exe',
+        'IISExpress.exe',
+        'ChromeDriver.exe',
+        'MicrosoftWebDriver.exe',
+        'iojs.exe',
+        'node.exe',
+        'dotnet.exe'
+    )
+
+    foreach ($imageName in $imageNames) {
+        & taskkill.exe /F /IM $imageName 2>$null | Out-Null
+    }
+
+    # run restore_repo.ps1 from the repo
+    $restoreScriptPath = Join-Path $repoRoot 'restore_repo.ps1'
+    if (Test-Path $restoreScriptPath) {
+        & $restoreScriptPath
+    } else {
+        Write-Warning "Restore script not found at path: $restoreScriptPath"
+    }
+
+    # build onestb project
+    $buildOneStbPath = Join-Path $repoRoot 'src\Shared\ProjectShortcuts\buildonestb'
+    if (Test-Path $buildOneStbPath) {
+        dotnet build $buildOneStbPath
+    } else {
+        Write-Warning "buildonestb path not found at: $buildOneStbPath"
+    }
+
+    # start IIS
+    net start w3svc
+
+    # Load onestb in the browser to warm up the local dev environment
+    Start-Process "https://onestb.cloudapp.net/"
 }
 
 function createworkitem {
@@ -1363,6 +3530,21 @@ function createpr {
     }
 }
 
+function runtests {
+    <#
+    .SYNOPSIS
+        Alias for Run-OnDemandCiTestWithUi - shows test picker dialog.
+    .DESCRIPTION
+        Shorthand command to open the test selection UI for running Azure DevOps pipeline tests.
+    .EXAMPLE
+        runtests
+    #>
+    [CmdletBinding()]
+    param()
+    
+    Run-OnDemandCiTestWithUi
+}
+
 function push {
     <#
     .SYNOPSIS
@@ -1437,6 +3619,9 @@ function push {
     }
     
     Write-Host "✓ Pushed to $currentBranch" -ForegroundColor Green
+
+    $myPullRequestsUrl = 'https://msazure.visualstudio.com/One/_git/AzureUX-PortalFx/pullrequests?_a=mine'
+    Start-Process $myPullRequestsUrl
 }
 
 # Query recent work items assigned to me with pagination
@@ -1500,40 +3685,21 @@ ORDER BY [System.CreatedDate] DESC
                 if ($VerbosePreference -eq 'Continue') { Write-Host "⏱ Starting WIQL query..." -ForegroundColor Gray }
                 $queryStart = Get-Date
                 
-                $attempt = 0
-                $maxAttempts = 2
-                $queryResult = $null
-                
-                do {
-                    try {
-                        # Execute WIQL query with top 50 limit
-                        $queryResult = az devops invoke `
-                            --organization 'https://dev.azure.com/msazure' `
-                            --area wit `
-                            --resource wiql `
-                            --route-parameters "project=One" `
-                            --query-parameters '$top=50' `
-                            --http-method POST `
-                            --api-version '7.1' `
-                            --media-type 'application/json' `
-                            --in-file $tempFile `
-                            --only-show-errors | ConvertFrom-Json
-                        
-                        break
-                    }
-                    catch {
-                        if ($attempt -eq 0) {
-                            Write-Host "Auth may be expired. Attempting login..." -ForegroundColor Yellow
-                            Ensure-AzDevOpsLogin
-                        }
-                        else {
-                            throw
-                        }
-                    }
-                    
-                    $attempt++
+                # Use helper function to handle authentication automatically
+                $queryResult = Invoke-WithAzDevOpsAuth -ScriptBlock {
+                    # Execute WIQL query with top 50 limit
+                    az devops invoke `
+                        --organization 'https://dev.azure.com/msazure' `
+                        --area wit `
+                        --resource wiql `
+                        --route-parameters "project=One" `
+                        --query-parameters '$top=50' `
+                        --http-method POST `
+                        --api-version '7.1' `
+                        --media-type 'application/json' `
+                        --in-file $tempFile `
+                        --only-show-errors | ConvertFrom-Json
                 }
-                while ($attempt -lt $maxAttempts)
                 
                 $queryEnd = Get-Date
                 $queryDuration = ($queryEnd - $queryStart).TotalSeconds
@@ -1567,29 +3733,21 @@ ORDER BY [System.CreatedDate] DESC
                         $jobs += Start-Job -ScriptBlock {
                             param($id, $org)
                             
-                            $attempt = 0
-                            $maxAttempts = 2
-                            
-                            do {
-                                try {
-                                    $result = az boards work-item show --organization $org --id $id --fields "System.Id,System.Title,System.State,System.CreatedDate" --expand none --only-show-errors -o json | ConvertFrom-Json
-                                    return $result
-                                }
-                                catch {
-                                    if ($attempt -eq 0) {
-                                        # Auth may be expired, let the parent process handle re-auth
-                                        return $null
-                                    }
-                                    else {
-                                        return $null
-                                    }
-                                }
-                                
-                                $attempt++
+                            try {
+                                $result = az boards work-item show `
+                                    --organization $org `
+                                    --id $id `
+                                    --fields "System.Id,System.Title,System.State,System.CreatedDate" `
+                                    --expand none `
+                                    --only-show-errors `
+                                    -o json | ConvertFrom-Json
+
+                                return $result
                             }
-                            while ($attempt -lt $maxAttempts)
-                            
-                            return $null
+                            catch {
+                                # Auth may be expired, let the parent process handle re-auth
+                                return $null
+                            }
                         } -ArgumentList $id, 'https://dev.azure.com/msazure'
                     }
                     
@@ -1727,9 +3885,21 @@ ORDER BY [System.CreatedDate] DESC
     }
 }
 
-#------------------------------------------------------------------------------
-# ALIASES
-#------------------------------------------------------------------------------
+#==============================================================================
+# CONVENIENT ALIASES AND SHORTCUTS
+#==============================================================================
+#
+# Short, memorable aliases for frequently used commands. These provide
+# quick access to common operations without sacrificing functionality.
+#
+# ALIAS CATEGORIES:
+# - Git Operations: s (status), nb (new branch), pr (pull request)
+# - Work Items: lwi (list work items)  
+# - Extensions: getextensiondetails (extension lookup)
+#
+# Each alias maintains full parameter support and help documentation
+# from the original function while providing faster typing.
+#==============================================================================
 
 # PR creation alias
 function pr {
@@ -1759,9 +3929,30 @@ function getextensiondetails {
     Get-ExtensionDetails @args
 }
 
-#------------------------------------------------------------------------------
+# 1P app scan alias
+function scanapps {
+    Invoke-FirstPartyAppScan @args
+}
+
+#==============================================================================
 # AUTOMATIC INITIALIZATION
-#------------------------------------------------------------------------------
+#==============================================================================
+#
+# This section handles automatic setup when the script is loaded.
+# Currently disabled to improve script load performance, but can be
+# re-enabled by uncommenting the initialization call below.
+#
+# WHAT IT DOES:
+# - Initializes extension cache for all cloud environments
+# - Pre-loads configuration data for faster lookups
+# - Runs silently in background without user interaction
+#
+# TRADE-OFFS:
+# - Faster subsequent extension lookups vs slower initial script load
+# - Network calls during script initialization vs on-demand loading
+# 
+# To re-enable automatic initialization, uncomment the line below:
+#==============================================================================
 
 # Initialize extension cache silently when script loads (directly in main scope)
 #Initialize-ExtensionCache | Out-Null
